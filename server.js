@@ -12,10 +12,13 @@ const express = require('express');
 // node-fetch has been observed to throw TLS "bad record mac" on multi-MB POSTs.
 const nodeFetch = require('node-fetch');
 const FormData = require('form-data');
+const multer = require('multer');
 const https = require('https');
 const path = require('path');
 const fs = require('fs');
-const { exec } = require('child_process');
+const os = require('os');
+const crypto = require('crypto');
+const { exec, execFile, spawn } = require('child_process');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -116,7 +119,8 @@ app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 // CORS headers for all responses
 app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
-    res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    // DELETE used by WebM export session cancel
+    res.header('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
     // X-API-Key is used for Gemini Interactions (image + video)
     res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-API-Key');
     if (req.method === 'OPTIONS') {
@@ -806,6 +810,401 @@ app.post('/api/xai/fetch-url', async (req, res) => {
     }
 });
 
+// ─── Transparent WebM export (ffmpeg) ─────────────────────────────
+// Client chroma-keys frames to PNG (RGBA); server packs them into
+// VP9 WebM with real alpha. Avoids Firefox MediaRecorder alpha bugs.
+//
+// Routes used by model-exporter.engine.ts (Adventurer mode):
+//   POST   /api/export/session
+//   POST   /api/export/session/:id/frame?index=N
+//   POST   /api/export/session/:id/finalize
+//   DELETE /api/export/session/:id
+//   GET    /api/export/status
+//   POST   /api/export/webm  (legacy bulk upload)
+
+const FFMPEG_MAX_FRAMES = 2000;
+
+/**
+ * Locate ffmpeg for transparent WebM export.
+ * Prefer a bundled binary (bin/ next to the app, or ffmpeg-static from npm)
+ * so end users do not need a system install.
+ */
+function resolveFfmpegPath() {
+    if (process.env.FFMPEG_PATH && fs.existsSync(process.env.FFMPEG_PATH)) {
+        return process.env.FFMPEG_PATH;
+    }
+
+    const binName = process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg';
+    const candidates = [
+        path.join(APP_DIR, 'bin', binName),
+        path.join(APP_DIR, binName),
+    ];
+    for (const c of candidates) {
+        if (fs.existsSync(c)) return c;
+    }
+
+    // npm dependency (node server.js / dev). Skip under pkg — snapshot paths
+    // are not valid spawn targets; the EXE build copies the binary to bin/.
+    if (!process.pkg) {
+        try {
+            const staticPath = require('ffmpeg-static');
+            if (staticPath && fs.existsSync(staticPath)) return staticPath;
+        } catch (_) {
+            /* optional */
+        }
+    }
+
+    return 'ffmpeg'; // last resort: system PATH
+}
+
+function probeFfmpeg() {
+    const ffmpegPath = resolveFfmpegPath();
+    return new Promise((resolve) => {
+        execFile(ffmpegPath, ['-version'], { timeout: 8000 }, (err, stdout) => {
+            if (err) {
+                resolve({ available: false, path: ffmpegPath, error: err.message });
+                return;
+            }
+            const firstLine = String(stdout || '').split('\n')[0] || '';
+            resolve({ available: true, path: ffmpegPath, version: firstLine.trim() });
+        });
+    });
+}
+
+function rmDirSafe(dir) {
+    if (!dir) return;
+    try {
+        fs.rmSync(dir, { recursive: true, force: true });
+    } catch (_) {
+        /* ignore */
+    }
+}
+
+function runFfmpeg(ffmpegPath, args, cwd) {
+    return new Promise((resolve, reject) => {
+        const child = spawn(ffmpegPath, args, {
+            cwd,
+            stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        let stderr = '';
+        child.stderr.on('data', (chunk) => {
+            stderr += chunk.toString();
+            if (stderr.length > 20000) stderr = stderr.slice(-12000);
+        });
+        child.on('error', (err) => reject(err));
+        child.on('close', (code) => {
+            if (code === 0) resolve({ stderr });
+            else reject(new Error(`ffmpeg exited ${code}: ${stderr.slice(-1500)}`));
+        });
+    });
+}
+
+app.get('/api/export/status', async (_req, res) => {
+    try {
+        const probe = await probeFfmpeg();
+        res.json({
+            ffmpeg: probe.available,
+            path: probe.path,
+            version: probe.version || null,
+            error: probe.error || null,
+            maxFrames: FFMPEG_MAX_FRAMES,
+            streaming: true,
+        });
+    } catch (err) {
+        res.status(500).json({ ffmpeg: false, error: err.message });
+    }
+});
+
+// ── Session export: stream PNGs to disk as the browser extracts them ──
+// POST   /api/export/session              → { sessionId }
+// POST   /api/export/session/:id/frame?index=N  (body: image/png)
+// POST   /api/export/session/:id/finalize → { fps, frameCount } → video/webm
+// DELETE /api/export/session/:id          → cancel / cleanup
+
+/** @type {Map<string, { dir: string, frames: number, created: number }>} */
+const exportSessions = new Map();
+const SESSION_TTL_MS = 60 * 60 * 1000; // 1 hour
+
+function getExportSession(id) {
+    return exportSessions.get(id) || null;
+}
+
+function destroyExportSession(id) {
+    const session = exportSessions.get(id);
+    if (!session) return;
+    exportSessions.delete(id);
+    rmDirSafe(session.dir);
+}
+
+// Reap abandoned sessions
+setInterval(() => {
+    const now = Date.now();
+    for (const [id, s] of exportSessions) {
+        if (now - s.created > SESSION_TTL_MS) {
+            console.log(`  [EXPORT] Reaping stale session ${id}`);
+            destroyExportSession(id);
+        }
+    }
+}, 5 * 60 * 1000).unref?.();
+
+function encodeWebmFromDir(exportDir, frameCount, fps) {
+    const outPath = path.join(exportDir, 'out.webm');
+    const ffmpegPath = resolveFfmpegPath();
+    const args = [
+        '-y',
+        '-hide_banner',
+        '-loglevel',
+        'error',
+        '-framerate',
+        String(fps),
+        '-start_number',
+        '0',
+        '-i',
+        path.join(exportDir, 'frame_%05d.png'),
+        '-frames:v',
+        String(frameCount),
+        '-c:v',
+        'libvpx-vp9',
+        '-pix_fmt',
+        'yuva420p',
+        '-auto-alt-ref',
+        '0',
+        '-b:v',
+        '0',
+        '-crf',
+        '28',
+        '-deadline',
+        'good',
+        '-cpu-used',
+        '2',
+        '-an',
+        outPath,
+    ];
+    return runFfmpeg(ffmpegPath, args, exportDir).then(() => outPath);
+}
+
+app.post('/api/export/session', async (_req, res) => {
+    try {
+        const probe = await probeFfmpeg();
+        if (!probe.available) {
+            return res.status(503).json({
+                error:
+                    'ffmpeg not found. Install ffmpeg (PATH or bin/ next to the app) for transparent WebM export.',
+                path: probe.path,
+            });
+        }
+        const sessionId = crypto.randomBytes(16).toString('hex');
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'as-export-'));
+        exportSessions.set(sessionId, { dir, frames: 0, created: Date.now() });
+        console.log(`  [EXPORT] Session ${sessionId} opened → ${dir}`);
+        res.json({ sessionId, maxFrames: FFMPEG_MAX_FRAMES });
+    } catch (err) {
+        res.status(500).json({ error: err.message || 'Failed to create export session' });
+    }
+});
+
+// Raw PNG body — avoids multipart overhead per frame
+app.post(
+    '/api/export/session/:id/frame',
+    express.raw({ type: ['image/png', 'application/octet-stream'], limit: '40mb' }),
+    (req, res) => {
+        const session = getExportSession(req.params.id);
+        if (!session) {
+            return res.status(404).json({ error: 'Unknown or expired export session' });
+        }
+
+        const index = parseInt(req.query.index, 10);
+        if (!Number.isFinite(index) || index < 0 || index >= FFMPEG_MAX_FRAMES) {
+            return res.status(400).json({ error: 'Invalid frame index' });
+        }
+        if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
+            return res.status(400).json({ error: 'Empty frame body' });
+        }
+        // PNG magic bytes
+        if (req.body.length < 8 || req.body[0] !== 0x89 || req.body[1] !== 0x50) {
+            return res.status(400).json({ error: 'Body is not a PNG image' });
+        }
+
+        try {
+            const name = `frame_${String(index).padStart(5, '0')}.png`;
+            fs.writeFileSync(path.join(session.dir, name), req.body);
+            session.frames = Math.max(session.frames, index + 1);
+            res.json({ ok: true, index, bytes: req.body.length });
+        } catch (err) {
+            res.status(500).json({ error: err.message || 'Failed to store frame' });
+        }
+    }
+);
+
+app.post('/api/export/session/:id/finalize', async (req, res) => {
+    const session = getExportSession(req.params.id);
+    if (!session) {
+        return res.status(404).json({ error: 'Unknown or expired export session' });
+    }
+
+    const fps = Math.max(1, Math.min(120, parseInt(req.body?.fps, 10) || 30));
+    let frameCount = parseInt(req.body?.frameCount, 10);
+    if (!Number.isFinite(frameCount) || frameCount < 1) {
+        frameCount = session.frames;
+    }
+    if (frameCount < 1) {
+        destroyExportSession(req.params.id);
+        return res.status(400).json({ error: 'No frames in session' });
+    }
+    if (frameCount > FFMPEG_MAX_FRAMES) {
+        destroyExportSession(req.params.id);
+        return res.status(400).json({ error: `Too many frames (max ${FFMPEG_MAX_FRAMES})` });
+    }
+
+    // Verify sequential frames exist
+    for (let i = 0; i < frameCount; i++) {
+        const p = path.join(session.dir, `frame_${String(i).padStart(5, '0')}.png`);
+        if (!fs.existsSync(p)) {
+            destroyExportSession(req.params.id);
+            return res.status(400).json({ error: `Missing frame ${i} on server` });
+        }
+    }
+
+    const exportDir = session.dir;
+    // Remove from map so reapers don't double-delete while encoding; we own cleanup now
+    exportSessions.delete(req.params.id);
+
+    try {
+        console.log(
+            `  [EXPORT] Finalize ${req.params.id}: ${frameCount} frames @ ${fps}fps`
+        );
+        const outPath = await encodeWebmFromDir(exportDir, frameCount, fps);
+
+        if (!fs.existsSync(outPath) || fs.statSync(outPath).size === 0) {
+            throw new Error('ffmpeg produced an empty output file');
+        }
+
+        res.setHeader('Content-Type', 'video/webm');
+        res.setHeader('Content-Disposition', 'attachment; filename="export.webm"');
+        const stream = fs.createReadStream(outPath);
+        const cleanup = () => rmDirSafe(exportDir);
+        stream.on('close', cleanup);
+        stream.on('error', (err) => {
+            console.error('  [ERROR] Export stream failed:', err.message);
+            cleanup();
+            if (!res.headersSent) res.status(500).json({ error: err.message });
+            else res.end();
+        });
+        res.on('close', () => {
+            if (!res.writableEnded) cleanup();
+        });
+        stream.pipe(res);
+    } catch (err) {
+        console.error('  [ERROR] WebM finalize failed:', err.message);
+        rmDirSafe(exportDir);
+        if (!res.headersSent) {
+            res.status(500).json({ error: err.message || 'Export failed' });
+        }
+    }
+});
+
+app.delete('/api/export/session/:id', (req, res) => {
+    destroyExportSession(req.params.id);
+    res.json({ ok: true });
+});
+
+// Legacy bulk upload (kept for compatibility; prefer streaming session API)
+const exportUpload = multer({
+    storage: multer.diskStorage({
+        destination: (req, _file, cb) => cb(null, req.exportDir),
+        filename: (_req, file, cb) => {
+            const base = path
+                .basename(file.originalname || 'frame.png')
+                .replace(/[^a-zA-Z0-9._-]/g, '_');
+            cb(null, base || 'frame.png');
+        },
+    }),
+    limits: {
+        files: FFMPEG_MAX_FRAMES,
+        fileSize: 40 * 1024 * 1024,
+        fieldSize: 1024 * 1024,
+    },
+    fileFilter: (_req, file, cb) => {
+        if (file.mimetype === 'image/png' || /\.png$/i.test(file.originalname || '')) {
+            cb(null, true);
+        } else {
+            cb(new Error('Only PNG frames are accepted'));
+        }
+    },
+});
+
+app.post(
+    '/api/export/webm',
+    (req, res, next) => {
+        try {
+            req.exportDir = fs.mkdtempSync(path.join(os.tmpdir(), 'as-export-'));
+            next();
+        } catch (err) {
+            res.status(500).json({ error: `Failed to create temp dir: ${err.message}` });
+        }
+    },
+    (req, res, next) => {
+        exportUpload.array('frames', FFMPEG_MAX_FRAMES)(req, res, (err) => {
+            if (err) {
+                rmDirSafe(req.exportDir);
+                return res.status(400).json({ error: err.message || 'Upload failed' });
+            }
+            next();
+        });
+    },
+    async (req, res) => {
+        const exportDir = req.exportDir;
+        try {
+            const probe = await probeFfmpeg();
+            if (!probe.available) {
+                rmDirSafe(exportDir);
+                return res.status(503).json({
+                    error: 'ffmpeg not found.',
+                    path: probe.path,
+                });
+            }
+            const files = req.files || [];
+            if (files.length === 0) {
+                rmDirSafe(exportDir);
+                return res.status(400).json({ error: 'No frames uploaded' });
+            }
+            const fps = Math.max(1, Math.min(120, parseInt(req.body.fps, 10) || 30));
+            const sorted = [...files].sort((a, b) =>
+                String(a.originalname || a.filename).localeCompare(
+                    String(b.originalname || b.filename),
+                    undefined,
+                    { numeric: true }
+                )
+            );
+            for (let i = 0; i < sorted.length; i++) {
+                const target = path.join(exportDir, `frame_${String(i).padStart(5, '0')}.png`);
+                const current = path.join(exportDir, sorted[i].filename);
+                if (path.resolve(current) !== path.resolve(target)) {
+                    if (fs.existsSync(target)) fs.unlinkSync(target);
+                    fs.renameSync(current, target);
+                }
+            }
+            const outPath = await encodeWebmFromDir(exportDir, sorted.length, fps);
+            if (!fs.existsSync(outPath) || fs.statSync(outPath).size === 0) {
+                throw new Error('ffmpeg produced an empty output file');
+            }
+            res.setHeader('Content-Type', 'video/webm');
+            res.setHeader('Content-Disposition', 'attachment; filename="export.webm"');
+            const stream = fs.createReadStream(outPath);
+            stream.on('close', () => rmDirSafe(exportDir));
+            stream.on('error', () => rmDirSafe(exportDir));
+            res.on('close', () => {
+                if (!res.writableEnded) rmDirSafe(exportDir);
+            });
+            stream.pipe(res);
+        } catch (err) {
+            console.error('  [ERROR] WebM export failed:', err.message);
+            rmDirSafe(exportDir);
+            if (!res.headersSent) res.status(500).json({ error: err.message || 'Export failed' });
+        }
+    }
+);
+
 // SPA fallback (Angular client routes)
 app.get('*', (req, res, next) => {
     if (req.path.startsWith('/api/')) return next();
@@ -823,13 +1222,23 @@ app.listen(PORT, () => {
     console.log('  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
     console.log(`  Server running at http://localhost:${PORT}`);
     console.log(`  Static root: ${staticRoot}`);
-    console.log('  Press Ctrl+C to stop');
-    console.log('');
+
+    probeFfmpeg().then((p) => {
+        if (p.available) {
+            console.log(`  ffmpeg: ready (${p.path})`);
+        } else {
+            console.log('  ffmpeg: NOT FOUND — transparent WebM export unavailable');
+            console.log('           Bundled releases need bin/ffmpeg(.exe) next to the app');
+            console.log('           Dev: npm run ensure-ffmpeg');
+        }
+        console.log('  Press Ctrl+C to stop');
+        console.log('');
+    });
 
     // Auto-open browser (skip in dev dual-stack / Flatpak)
     if (process.env.SKIP_BROWSER === '1') return;
     const url = `http://localhost:${PORT}`;
-    const start = process.platform === 'win32' ? 'start' :
-                  process.platform === 'darwin' ? 'open' : 'xdg-open';
+    const start =
+        process.platform === 'win32' ? 'start' : process.platform === 'darwin' ? 'open' : 'xdg-open';
     exec(`${start} ${url}`);
 });
