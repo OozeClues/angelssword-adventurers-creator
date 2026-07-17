@@ -4,10 +4,29 @@
   "description": "⚔️ AS Adventurer — VTuber Creation Pipeline by Angel's Sword Studios",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node scripts/ensure-ffmpeg.js --quiet; node server.js",
+    "build": "npm run build --prefix client",
+    "build:release": "node build-exe.js",
+    "build:exe": "node build-exe.js --target win-x64",
+    "build:windows": "node build-exe.js --target win-x64",
+    "build:windows:arm64": "node build-exe.js --target win-arm64",
+    "build:linux": "node build-exe.js --target linux-x64",
+    "build:linux:arm64": "node build-exe.js --target linux-arm64",
+    "build:linux:flatpak": "node build-exe.js --target linux-flatpak",
+    "build:linux:flatpak:arm64": "node build-exe.js --target linux-flatpak-arm64",
+    "build:mac": "node build-exe.js --target mac-x64",
+    "build:mac:arm64": "node build-exe.js --target mac-arm64",
+    "build:mac:silicon": "node build-exe.js --target mac-arm64",
+    "build:all": "node build-exe.js --target all",
+    "build:all:flatpak": "node build-exe.js --target all-flatpak",
+    "ensure-ffmpeg": "node scripts/ensure-ffmpeg.js --copy",
+    "dev:client": "npm start --prefix client",
+    "dev:server": "node scripts/ensure-ffmpeg.js --quiet; node server.js",
+    "postinstall": "npm install --prefix client || true"
   },
   "dependencies": {
     "express": "^4.21.0",
+    "ffmpeg-static": "^5.3.0",
     "form-data": "^4.0.0",
     "multer": "^1.4.5-lts.1",
     "node-fetch": "^2.7.0"
@@ -18,5 +37,10 @@
   "devDependencies": {
     "rcedit": "^5.0.2",
     "sharp": "^0.35.3"
+  },
+  "pkg": {
+    "scripts": "server.js",
+    "targets": ["node18-win-x64"],
+    "outputPath": "dist"
   }
 }

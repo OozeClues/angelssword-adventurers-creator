@@ -29,9 +29,19 @@ npm run build:linux:flatpak
 # Reuse an existing dist/ASAdventurer-linux-x64/ tree
 node build-exe.js --target linux-flatpak --flatpak-only
 
-# ARM64 (build host should match, or use a matching pkg binary)
+# ARM64 Flatpak — only on aarch64 hosts (or multiarch/QEMU)
+# On x86_64 WSL/Linux this is skipped during build:all:flatpak with a clear note.
 npm run build:linux:flatpak:arm64
+# Force cross attempt (needs aarch64 Platform/Sdk + qemu-user-static):
+# FLATPAK_ALLOW_CROSS=1 npm run build:linux:flatpak:arm64
 ```
+
+> **Arch note:** `flatpak-builder` exports the **host** Flatpak arch unless you pass
+> `--arch=…`. Our builder always passes the correct arch. Building
+> `linux-flatpak-arm64` on an x86_64 machine fails without QEMU/multiarch — use
+> an ARM host (or `FLATPAK_ALLOW_CROSS=1` after installing
+> `org.freedesktop.Platform/aarch64/25.08`). The ZIP package
+> (`ASAdventurer-linux-arm64.zip`) still cross-builds fine via `pkg`.
 
 Outputs:
 

@@ -14,6 +14,7 @@ const nodeFetch = require('node-fetch');
 const FormData = require('form-data');
 const https = require('https');
 const path = require('path');
+const fs = require('fs');
 const { exec } = require('child_process');
 
 const app = express();
@@ -124,11 +125,18 @@ app.use((req, res, next) => {
     next();
 });
 
-// Static files
-// Detect pkg-compiled exe vs normal Node.js
+// Static files — pkg release uses www/ next to the binary; dev uses client dist or public/
 const APP_DIR = process.pkg ? path.dirname(process.execPath) : __dirname;
-
-app.use(express.static(path.join(APP_DIR, 'public')));
+const staticCandidates = [
+    path.join(APP_DIR, 'www'),
+    path.join(APP_DIR, 'client', 'dist', 'client', 'browser'),
+    path.join(APP_DIR, 'client', 'dist', 'browser'),
+    path.join(APP_DIR, 'public'),
+];
+const staticRoot =
+    staticCandidates.find((p) => fs.existsSync(path.join(p, 'index.html'))) ||
+    path.join(APP_DIR, 'public');
+app.use(express.static(staticRoot));
 
 // --- API Proxy Routes ---
 
@@ -798,16 +806,27 @@ app.post('/api/xai/fetch-url', async (req, res) => {
     }
 });
 
+// SPA fallback (Angular client routes)
+app.get('*', (req, res, next) => {
+    if (req.path.startsWith('/api/')) return next();
+    const indexPath = path.join(staticRoot, 'index.html');
+    if (fs.existsSync(indexPath)) {
+        return res.sendFile(indexPath);
+    }
+    res.status(404).send('UI not found. Build the client (npm run build) or use a release package.');
+});
+
 // --- Server Start ---
 app.listen(PORT, () => {
     console.log('');
     console.log('  ⚔️  AS Adventurer — VTuber Creation Pipeline');
     console.log('  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
     console.log(`  Server running at http://localhost:${PORT}`);
+    console.log(`  Static root: ${staticRoot}`);
     console.log('  Press Ctrl+C to stop');
     console.log('');
 
-    // Auto-open browser (skip in dev dual-stack)
+    // Auto-open browser (skip in dev dual-stack / Flatpak)
     if (process.env.SKIP_BROWSER === '1') return;
     const url = `http://localhost:${PORT}`;
     const start = process.platform === 'win32' ? 'start' :
