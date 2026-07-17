@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=AS Adventurer Creator
+GenericName=VTuber Creation Pipeline
+Comment=Design, generate, prepare, and export VTuber / PNGtuber assets
+Exec=as-adventurer
+Icon=studio.angelssword.ASAdventurer
+Terminal=true
+Categories=Graphics;AudioVideo;Development;
+Keywords=VTuber;PNGtuber;sprite;animation;WebM;GIF;
+StartupNotify=true
