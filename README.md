@@ -23,11 +23,11 @@ AS Adventurer walks you through a **4-step pipeline**:
 
 **AI providers (configure in Settings; pick per step when keys/session are ready):**
 
-| Feature             | Providers                                                                                 |
-| ------------------- | ----------------------------------------------------------------------------------------- |
-| Sprite generation   | **OpenAI** GPT Image 2 · **Gemini** Image · **Grok Imagine** (API key or SuperGrok OAuth) |
-| Video generation    | **Gemini** Omni Flash · **Grok Imagine Video** (API key or SuperGrok OAuth)               |
-| Video Prep + Export | Fully offline — no API keys                                                               |
+| Feature             | Providers                                                                                                          |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| Sprite generation   | **OpenAI** GPT Image 2 · **Gemini** Image · **Grok Imagine** (API key or SuperGrok OAuth) · **Local ComfyUI**      |
+| Video generation    | **Gemini** Omni Flash · **Grok Imagine Video** (API key or SuperGrok OAuth) · **Local ComfyUI**                    |
+| Video Prep + Export | Fully offline — no API keys                                                                                        |
 
 > **No AI keys required** if you bring your own sprites and videos. Steps ③–④ work fully offline.
 
@@ -138,9 +138,22 @@ Controls: key color (shared pipeline color + eyedropper), similarity, smoothness
 | **OpenAI API key**        | GPT Image 2 sprites                                                                                                                                                  |
 | **Google Gemini API key** | Gemini image + Omni Flash video                                                                                                                                      |
 | **Grok Imagine**          | Image + video via **API key** _or_ **SuperGrok / X Premium+ OAuth** — master toggle (`as_xai_backend` in localStorage) chooses which credential every Grok call uses |
+| **Local ComfyUI**         | Discover/connect a ComfyUI instance on localhost or LAN; pick image/video **templates** (or paste custom API-format workflow JSON)                                   |
 | **Notifications**         | Sound on generation complete                                                                                                                                         |
 
-Credentials live only in browser **localStorage** and are sent only to official OpenAI / Google / xAI (`auth.x.ai` / `api.x.ai`) endpoints through the **local** Node proxy.
+Credentials live only in browser **localStorage** and are sent only to official OpenAI / Google / xAI (`auth.x.ai` / `api.x.ai`) endpoints through the **local** Node proxy. Local ComfyUI traffic stays on your machine/LAN via the same proxy.
+
+### Local ComfyUI
+
+1. Run [ComfyUI](https://github.com/comfyanonymous/ComfyUI) (default `http://127.0.0.1:8188`).
+2. Open **Settings → Local ComfyUI** — the app auto-scans localhost on startup; use **Scan LAN** for another machine on your network.
+3. Pick an **image** and **video** workflow source:
+   - **Custom (API JSON)** — first in the list; paste a workflow exported with Comfy’s **Save (API Format)**
+   - **From history** — past runs on that ComfyUI instance (reuses the graph; injects this app’s prompt/images)
+   - **Templates** — catalog from the instance (open-source/local by default)
+4. In Sprite Prep / Generate Video, select provider **Local ComfyUI**.
+
+Required models must already be installed in ComfyUI. After connecting, **Models in workflow** lists checkpoint / UNET / LoRA loaders found in the selected image and video graphs so you can pick installed files and toggle LoRA strength (or disable a LoRA at strength 0). Use **Refresh templates, history & models** after installing new weights or running jobs in Comfy. For custom workflows, title prompt nodes `__PROMPT__` and image loaders `__IMAGE_0__` for reliable injection.
 
 ---
 
@@ -156,7 +169,8 @@ This repository is based on [AngelsSwordStudios/angelssword-adventurers-creator]
 
 ### AI / providers
 
-- **Multi-provider image gen:** OpenAI GPT Image 2, Gemini Image, Grok Imagine (not OpenAI-only)
+- **Multi-provider image gen:** OpenAI GPT Image 2, Gemini Image, Grok Imagine, Local ComfyUI (not OpenAI-only)
+- **Local ComfyUI:** server-side discovery (localhost + optional LAN), template catalog, custom API workflows
 - **Multi-provider video gen:** Gemini Omni Flash + Grok Imagine Video (not Gemini-only)
 - Per-provider **aspect / size / resolution / duration** caps in the UI
 - **Grok dual backend:** xAI console API key **or** SuperGrok device-code OAuth, with a discrete **master toggle** and clear active-backend status
@@ -211,6 +225,7 @@ WebM with alpha also works in OBS browser sources and similar tools.
 ```
 angelssword-adventurers-creator/
 ├── server.js                 # Express: static UI, OpenAI/Gemini/xAI proxies, OAuth, export
+├── comfy/                    # Local ComfyUI discovery, templates, generation proxy
 ├── package.json              # Root scripts: start, build, multi-platform packaging
 ├── client/                   # Angular 22 app (primary UI)
 │   ├── src/app/
@@ -248,6 +263,7 @@ angelssword-adventurers-creator/
 | `npm start` fails     | Node 18+; run `npm install` (and under `client/`)                          |
 | OpenAI / Gemini fails | Settings → key + Test; check credits                                       |
 | Grok not available    | Settings → API key **or** SuperGrok login; check **active backend** toggle |
+| Local ComfyUI missing | Start ComfyUI; Settings → Scan localhost/LAN or enter URL; pick a template |
 | Grok token expired    | Refresh Token or re-login                                                  |
 | Video won’t load      | Prefer MP4 H.264                                                           |
 | Export fringe         | Raise Spill Suppression / tweak Similarity                                 |

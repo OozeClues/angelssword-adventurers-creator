@@ -19,6 +19,7 @@ const fs = require('fs');
 const os = require('os');
 const crypto = require('crypto');
 const { exec, execFile, spawn } = require('child_process');
+const comfy = require('./comfy');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -990,6 +991,9 @@ app.get('/api/export/status', async (_req, res) => {
         res.status(500).json({ ffmpeg: false, error: err.message });
     }
 });
+
+// --- Local ComfyUI (discovery + template workflows + generation) ---
+comfy.registerRoutes(app);
 
 // ── Session export: stream PNGs to disk as the browser extracts them ──
 // POST   /api/export/session              → { sessionId }

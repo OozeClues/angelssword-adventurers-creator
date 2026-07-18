@@ -1170,6 +1170,20 @@ input[type="range"]::-moz-range-thumb {
     transition: width 0.3s ease;
 }
 
+.progress-bar .fill.indeterminate {
+    width: 40% !important;
+    animation: progress-indeterminate 1.2s ease-in-out infinite;
+}
+
+@keyframes progress-indeterminate {
+    0% {
+        transform: translateX(-100%);
+    }
+    100% {
+        transform: translateX(250%);
+    }
+}
+
 .progress-text {
     font-family: var(--font-mono);
     font-size: 0.7rem;
@@ -1560,6 +1574,37 @@ input[type="range"]::-moz-range-thumb {
    ============================================ */
 .settings-section {
     max-width: 640px;
+}
+
+/* Two-column settings: keys/about left, Grok + Comfy right */
+.settings-section.settings-two-col {
+    max-width: min(1200px, 100%);
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.15fr);
+    gap: 1.25rem;
+    align-items: start;
+}
+
+.settings-col {
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+    min-width: 0;
+}
+
+.settings-col > .glass-panel {
+    margin-bottom: 1rem;
+}
+
+.settings-col > .settings-info {
+    margin-top: 0;
+}
+
+@media (max-width: 960px) {
+    .settings-section.settings-two-col {
+        grid-template-columns: 1fr;
+        max-width: 720px;
+    }
 }
 
 .api-key-row {

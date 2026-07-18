@@ -19,6 +19,7 @@ import { CancelService } from '../../core/cancel.service';
 import { UploadZoneComponent } from '../../shared/components/upload-zone.component';
 import { ModeSelectorComponent } from '../../shared/components/mode-selector.component';
 import { GenCountComponent } from '../../shared/components/gen-count.component';
+import { ComfyOptionsPanelComponent } from '../../shared/components/comfy-options-panel.component';
 import { downloadBlob, fileToDataUrl, scrollAppResultsIntoView } from '../../shared/utils/media';
 import {
   VIDEO_PROVIDERS,
@@ -34,7 +35,13 @@ const DEFAULT_PROMPT = `Locked-off Position Static Camera. Perfect Seamless Loop
 
 @Component({
   selector: 'app-video-gen',
-  imports: [FormsModule, UploadZoneComponent, ModeSelectorComponent, GenCountComponent],
+  imports: [
+    FormsModule,
+    UploadZoneComponent,
+    ModeSelectorComponent,
+    GenCountComponent,
+    ComfyOptionsPanelComponent,
+  ],
   templateUrl: './video-gen.component.html',
 })
 export class VideoGenComponent implements OnDestroy {
@@ -61,13 +68,17 @@ export class VideoGenComponent implements OnDestroy {
   readonly videoProviderNote = computed(() => {
     const sel = this.settings.videoProviderSelection();
     if (!sel.provider) {
-      return 'No video providers ready. Add a Gemini or xAI key — or log in with SuperGrok — in Settings.';
+      return 'No video providers ready. Add a Gemini or xAI key — log in with SuperGrok — or connect Local ComfyUI in Settings.';
     }
     if (sel.fellBack) {
       return `Using ${sel.provider.label} (fallback — preferred provider has no API key).`;
     }
     if (sel.provider.keyProvider === 'xai') {
       return `${sel.provider.label} via ${this.settings.xaiBackendLabel()} · configure in Settings`;
+    }
+    if (sel.provider.keyProvider === 'comfy') {
+      const name = this.settings.comfyVideoSelectionLabel() || 'workflow not selected';
+      return `${sel.provider.label} · ${this.settings.comfyBaseUrl() || 'connected'} · ${name}`;
     }
     if (sel.provider.recommended) {
       return `${sel.provider.label} · recommended for VTuber animation`;
@@ -87,7 +98,35 @@ export class VideoGenComponent implements OnDestroy {
     () => getVideoProvider(this.settings.videoProviderSelection().provider?.id)?.caps ?? null
   );
 
-  readonly supportsKeyframe = computed(() => this.videoCaps()?.supportsKeyframe ?? false);
+  readonly usingComfyVideo = computed(
+    () => this.settings.videoProviderSelection().provider?.keyProvider === 'comfy'
+  );
+
+  /**
+   * Cloud models use catalog caps; Comfy uses LoadImage count (≥2 ⇒ keyframe OK).
+   */
+  readonly supportsKeyframe = computed(() => {
+    if (this.usingComfyVideo()) {
+      return this.settings.comfyVideoImageSlots().length >= 2;
+    }
+    return this.videoCaps()?.supportsKeyframe ?? false;
+  });
+
+  /**
+   * Which Comfy image roles currently have source pixels.
+   * Reference mode uses reference_0; keyframe uses start/end only.
+   */
+  readonly comfyActiveRoles = computed(() => {
+    const roles: Array<'reference_0' | 'start_frame' | 'end_frame'> = [];
+    if (this.mode() === 'keyframe') {
+      if (this.startFrame()) roles.push('start_frame');
+      if (this.endFrame()) roles.push('end_frame');
+    } else {
+      if (this.referenceImages().length > 0) roles.push('reference_0');
+      if (this.referenceImages().length > 1) roles.push('end_frame');
+    }
+    return roles;
+  });
 
   /** Mode buttons — keyframe disabled (not hidden) when the model can't do start+end frames. */
   readonly modeOptions = computed(() => {
@@ -122,6 +161,8 @@ export class VideoGenComponent implements OnDestroy {
   readonly duration = signal(5);
   readonly genCount = signal(1);
   readonly generating = signal(false);
+  /** 0–100 for Comfy live progress; -1 = indeterminate. */
+  readonly genProgress = signal(-1);
   readonly genStatus = signal<{ type: string; text: string } | null>(null);
   readonly videos = signal<GeneratedVideo[]>([]);
   /** Single result chosen to hand off to Video Prep (index into videos()). */
@@ -180,12 +221,21 @@ export class VideoGenComponent implements OnDestroy {
     }
     this.referenceImages.set(urls);
     this.fromSpritePrep.set(false);
+    if (this.usingComfyVideo()) {
+      this.settings.ensureComfyImageBinding('video', 'reference_0');
+      if (urls.length > 1) this.settings.ensureComfyImageBinding('video', 'end_frame');
+      else this.settings.clearComfyImageBinding('video', 'end_frame');
+    }
     this.toast.show(`${urls.length} reference image(s) loaded`, 'success');
   }
 
   clearRefs(): void {
     this.referenceImages.set([]);
     this.fromSpritePrep.set(false);
+    if (this.usingComfyVideo()) {
+      this.settings.clearComfyImageBinding('video', 'reference_0');
+      this.settings.clearComfyImageBinding('video', 'end_frame');
+    }
   }
 
   async onStartFrame(files: FileList): Promise<void> {
@@ -195,6 +245,9 @@ export class VideoGenComponent implements OnDestroy {
     const refs = [...this.referenceImages()];
     refs[0] = url;
     this.referenceImages.set(refs);
+    if (this.usingComfyVideo()) {
+      this.settings.ensureComfyImageBinding('video', 'start_frame');
+    }
     this.toast.show('Start frame loaded', 'success');
   }
 
@@ -206,6 +259,9 @@ export class VideoGenComponent implements OnDestroy {
     if (refs.length === 0) refs.push('');
     refs[1] = url;
     this.referenceImages.set(refs);
+    if (this.usingComfyVideo()) {
+      this.settings.ensureComfyImageBinding('video', 'end_frame');
+    }
     this.toast.show('End frame loaded', 'success');
   }
 
@@ -236,16 +292,39 @@ export class VideoGenComponent implements OnDestroy {
       return;
     }
     this.mode.set(value === 'keyframe' ? 'keyframe' : 'reference');
+    // Drop inactive-mode assignments so roles don't stack on the same LoadImage
+    if (this.usingComfyVideo()) {
+      if (value === 'keyframe') {
+        this.settings.clearComfyImageBinding('video', 'reference_0');
+        if (this.startFrame()) this.settings.ensureComfyImageBinding('video', 'start_frame');
+        if (this.endFrame()) this.settings.ensureComfyImageBinding('video', 'end_frame');
+      } else {
+        this.settings.clearComfyImageBinding('video', 'start_frame');
+        this.settings.clearComfyImageBinding('video', 'end_frame');
+        if (this.referenceImages().length) {
+          this.settings.ensureComfyImageBinding('video', 'reference_0');
+        }
+        if (this.referenceImages().length > 1) {
+          this.settings.ensureComfyImageBinding('video', 'end_frame');
+        }
+      }
+    }
   }
 
   private syncVideoFormatToProvider(id: VideoProviderId): void {
     const caps = getVideoProvider(id)?.caps;
     if (!caps) return;
 
-    if (!caps.supportsKeyframe && this.mode() === 'keyframe') {
+    const keyOk =
+      getVideoProvider(id)?.keyProvider === 'comfy'
+        ? this.settings.comfyVideoImageSlots().length >= 2
+        : !!caps.supportsKeyframe;
+    if (!keyOk && this.mode() === 'keyframe') {
       this.mode.set('reference');
       this.toast.show(
-        `${getVideoProvider(id)?.label || 'This model'} does not support keyframe mode — switched to Reference Mode.`,
+        getVideoProvider(id)?.keyProvider === 'comfy'
+          ? 'This Comfy workflow has fewer than two image inputs — switched to Reference Mode.'
+          : `${getVideoProvider(id)?.label || 'This model'} does not support keyframe mode — switched to Reference Mode.`,
         'warning'
       );
     }
@@ -302,7 +381,7 @@ export class VideoGenComponent implements OnDestroy {
     const sel = this.settings.videoProviderSelection();
     if (!sel.provider) {
       this.toast.show(
-        'Add a Gemini or xAI key — or log in with SuperGrok — in Settings first',
+        'Add a Gemini or xAI key — log in with SuperGrok — or connect Local ComfyUI in Settings first',
         'warning'
       );
       return;
@@ -321,6 +400,7 @@ export class VideoGenComponent implements OnDestroy {
 
     this.generating.set(true);
     this.cancelled = false;
+    this.genProgress.set(sel.provider.keyProvider === 'comfy' ? 0 : -1);
     this.genStatus.set({
       type: 'info',
       text: `Generating video with ${sel.provider.label} — this may take several minutes…`,
@@ -336,6 +416,7 @@ export class VideoGenComponent implements OnDestroy {
       const promises: Promise<GeneratedVideo>[] = [];
       for (let i = 0; i < this.genCount(); i++) {
         if (this.cancelled) break;
+        const idx = i;
         promises.push(
           this.api.generateVideo({
             prompt,
@@ -347,6 +428,18 @@ export class VideoGenComponent implements OnDestroy {
             resolution: this.videoResolutionOptions().length
               ? this.videoResolution()
               : undefined,
+            onProgress: (p) => {
+              if (this.cancelled) return;
+              const label =
+                this.genCount() > 1 ? `[${idx + 1}/${this.genCount()}] ` : '';
+              this.genStatus.set({
+                type: 'info',
+                text: `${label}${p.message || 'Working…'}`,
+              });
+              if (typeof p.percent === 'number' && p.percent >= 0) {
+                this.genProgress.set(Math.min(100, p.percent));
+              }
+            },
           })
         );
       }
@@ -382,12 +475,16 @@ export class VideoGenComponent implements OnDestroy {
       this.genStatus.set({ type: 'error', text: `❌ ${(err as Error).message}` });
     } finally {
       this.generating.set(false);
+      this.genProgress.set(-1);
     }
   }
 
   cancelGenerate(): void {
     this.cancelled = true;
+    void this.api.cancelComfyJob();
     this.toast.show('Generation cancelled', 'warning');
+    this.generating.set(false);
+    this.genProgress.set(-1);
   }
 
   /** Exclusive single selection for pipeline handoff. */

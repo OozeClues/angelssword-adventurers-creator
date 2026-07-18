@@ -81,8 +81,14 @@
       />
       @if (!supportsKeyframe()) {
         <div class="text-dim mt-1" style="font-size: 0.7rem">
-          Keyframe mode (start + end frames) is not available for this model. Use a single reference
-          image instead.
+          @if (usingComfyVideo()) {
+            Keyframe mode needs a video workflow with at least two LoadImage nodes (start + end).
+            This workflow has {{ settings.comfyVideoImageSlots().length }} image input(s) — use Reference Mode,
+            or pick a dual-image / keyframe workflow in the Local ComfyUI panel.
+          } @else {
+            Keyframe mode (start + end frames) is not available for this model. Use a single reference
+            image instead.
+          }
         </div>
       }
 
@@ -187,9 +193,18 @@
       </button>
 
       <div class="progress-container" [class.active]="generating()">
-        <div class="progress-bar"><div class="fill" style="width: 40%"></div></div>
+        <div class="progress-bar">
+          <div
+            class="fill"
+            [class.indeterminate]="genProgress() < 0"
+            [style.width.%]="genProgress() < 0 ? 40 : genProgress()"
+          ></div>
+        </div>
         <div class="progress-text">
-          <span>Generating video...</span>
+          <span>{{ genStatus()?.type === 'info' ? genStatus()!.text : 'Generating video…' }}</span>
+          @if (genProgress() >= 0) {
+            <span class="text-dim" style="margin-left: 0.35rem">{{ genProgress() }}%</span>
+          }
           <button type="button" class="btn btn-sm btn-danger" (click)="cancelGenerate()">Cancel</button>
         </div>
       </div>
@@ -234,28 +249,31 @@
   </div>
 
   <aside class="main-layout-sidebar">
-    <div class="glass-panel">
-      <div class="panel-title"><span class="title-icon">ℹ️</span> About Generate Video</div>
-      <div class="panel-subtitle">
-        Turn a still reference (sprite or photo) into a short animated clip using online video models — ideal for idle
-        loops, talking motions, and simple character movement before you refine the loop in Video Prep.
+    @if (usingComfyVideo()) {
+      <app-comfy-options-panel kind="video" [activeRoles]="comfyActiveRoles()" />
+    } @else {
+      <div class="glass-panel">
+        <div class="panel-title"><span class="title-icon">ℹ️</span> About Generate Video</div>
+        <div class="panel-subtitle">
+          Turn a still reference (sprite or photo) into a short animated clip using online video models — ideal for idle
+          loops, talking motions, and simple character movement before you refine the loop in Video Prep.
+        </div>
+        <div class="panel-subtitle mt-1">
+          <strong class="text-gold">Why Gemini is preferred:</strong> Gemini Omni Flash is the recommended default here —
+          it supports image-to-video and true start+end keyframe mode, and the stock animation prompt is tuned for it. You
+          can still switch to Grok Imagine Video (API key or SuperGrok) or Local ComfyUI when that fits your setup better.
+        </div>
+        <div class="panel-subtitle mt-1">
+          <strong class="text-gold">Editing the prompt:</strong> Replace
+          <span class="text-mono">(Character description)</span> with a simple note about the character and their mood, and
+          <span class="text-mono">(Animation Type)</span> with a minimal description of the actions they perform in the
+          loop. Keep the camera-lock constraints unless you intentionally want camera motion.
+        </div>
+        <div class="settings-info">
+          <span class="info-icon">🔑</span>
+          Configure Gemini, Grok API key, SuperGrok OAuth, or Local ComfyUI in the <strong>Settings</strong> tab.
+        </div>
       </div>
-      <div class="panel-subtitle mt-1">
-        <strong class="text-gold">Why Gemini is preferred:</strong> Gemini Omni Flash is the recommended default here —
-        it supports image-to-video and true start+end keyframe mode, and the stock animation prompt is tuned for it. You
-        can still switch to Grok Imagine Video (API key or SuperGrok) when that fits your setup better.
-      </div>
-      <div class="panel-subtitle mt-1">
-        <strong class="text-gold">Editing the prompt:</strong> Replace
-        <span class="text-mono">(Character description)</span> with a simple note about the character and their mood, and
-        <span class="text-mono">(Animation Type)</span> with a minimal description of the actions they perform in the
-        loop. Keep the camera-lock constraints unless you intentionally want camera motion.
-      </div>
-      <div class="settings-info">
-        <span class="info-icon">🔑</span>
-        Configure Gemini, Grok API key, or SuperGrok OAuth in the <strong>Settings</strong> tab. Or skip this step and
-        upload your own video in Video Prep.
-      </div>
-    </div>
+    }
   </aside>
 </div>

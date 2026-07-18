@@ -39,7 +39,10 @@
     "sharp": "^0.35.3"
   },
   "pkg": {
-    "scripts": "server.js",
+    "scripts": [
+      "server.js",
+      "comfy/**/*.js"
+    ],
     "targets": ["node18-win-x64"],
     "outputPath": "dist"
   }

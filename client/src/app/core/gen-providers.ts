@@ -1,9 +1,9 @@
-/** Online generation providers for image / video tools. */
+/** Online + local generation providers for image / video tools. */
 
-export type KeyProvider = 'openai' | 'google' | 'xai';
+export type KeyProvider = 'openai' | 'google' | 'xai' | 'comfy';
 
-export type ImageProviderId = 'openai-gpt-image' | 'gemini-image' | 'grok-image';
-export type VideoProviderId = 'gemini-omni' | 'grok-video';
+export type ImageProviderId = 'openai-gpt-image' | 'gemini-image' | 'grok-image' | 'comfy-image';
+export type VideoProviderId = 'gemini-omni' | 'grok-video' | 'comfy-video';
 
 export interface SelectOption {
   value: string;
@@ -146,6 +146,18 @@ export const IMAGE_PROVIDERS: ImageProviderDef[] = [
       defaultResolution: '1k',
     },
   },
+  {
+    id: 'comfy-image',
+    label: 'Local ComfyUI',
+    description:
+      'Local ComfyUI instance — uses a template workflow (or custom API JSON) on your machine / LAN. No cloud API key.',
+    keyProvider: 'comfy',
+    modelId: 'comfy-template',
+    caps: {
+      aspectRatios: SPRITE_ASPECTS,
+      defaultAspect: '16:9',
+    },
+  },
 ];
 
 export const VIDEO_PROVIDERS: VideoProviderDef[] = [
@@ -191,6 +203,22 @@ export const VIDEO_PROVIDERS: VideoProviderDef[] = [
       defaultResolution: '720p',
     },
   },
+  {
+    id: 'comfy-video',
+    label: 'Local ComfyUI',
+    description:
+      'Local ComfyUI instance — image-to-video / text-to-video via a video template or custom API workflow. No cloud API key.',
+    keyProvider: 'comfy',
+    modelId: 'comfy-template',
+    caps: {
+      aspectRatios: VIDEO_ASPECTS,
+      durationMin: 1,
+      durationMax: 15,
+      // Catalog default true; UI + API still require the selected workflow to have ≥2 LoadImage nodes.
+      supportsKeyframe: true,
+      defaultAspect: '16:9',
+    },
+  },
 ];
 
 export const DEFAULT_IMAGE_PROVIDER: ImageProviderId = 'openai-gpt-image';
@@ -208,6 +236,8 @@ export interface ProviderKeys {
   xaiOAuth: boolean;
   /** Master toggle: which Grok backend is active. */
   xaiBackend: XaiBackend;
+  /** Local ComfyUI instance reachable via the app proxy. */
+  comfyConnected: boolean;
 }
 
 /** True when the active Grok backend has usable credentials. */
@@ -220,6 +250,7 @@ export function providerNeedsKey(def: GenProviderDef, keys: ProviderKeys): boole
   if (def.keyProvider === 'openai') return !!keys.openai.trim();
   if (def.keyProvider === 'google') return !!keys.google.trim();
   if (def.keyProvider === 'xai') return xaiBackendReady(keys);
+  if (def.keyProvider === 'comfy') return !!keys.comfyConnected;
   return false;
 }
 

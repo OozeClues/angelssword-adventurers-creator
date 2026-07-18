@@ -15,6 +15,20 @@ export interface GeneratedVideo {
   url: string;
 }
 
+/** Live progress from Local ComfyUI async jobs. */
+export interface ComfyJobProgress {
+  jobId?: string;
+  status?: string;
+  message?: string;
+  percent?: number;
+  node?: string | null;
+  nodeType?: string | null;
+  value?: number;
+  max?: number;
+  promptId?: string | null;
+  error?: string | null;
+}
+
 @Injectable({ providedIn: 'root' })
 export class ApiService {
   private readonly http = inject(HttpClient);
@@ -30,12 +44,14 @@ export class ApiService {
     aspectRatio?: string;
     /** Gemini image_size (1K) or Grok resolution (1k) */
     resolution?: string;
+    /** Local ComfyUI only — live node / sampling progress. */
+    onProgress?: (p: ComfyJobProgress) => void;
   }): Promise<string> {
     const sel = this.settings.imageProviderSelection();
     const id = opts.provider || sel.provider?.id;
     if (!id) {
       throw new Error(
-        'No image provider available. Add an OpenAI, Gemini, or xAI (Grok) key — or log in with SuperGrok — in Settings.'
+        'No image provider available. Add an OpenAI, Gemini, or xAI (Grok) key — log in with SuperGrok — or connect Local ComfyUI in Settings.'
       );
     }
     const def = IMAGE_PROVIDERS.find((p) => p.id === id);
@@ -62,7 +78,172 @@ export class ApiService {
         opts.resolution
       );
     }
+    if (def.keyProvider === 'comfy') {
+      return this.generateImageComfy(opts);
+    }
     throw new Error(`Unsupported image provider: ${id}`);
+  }
+
+  /**
+   * Local ComfyUI image generation via template or custom workflow.
+   */
+  private async generateImageComfy(opts: {
+    prompt: string;
+    images?: { label: string; data: string }[];
+    size?: string;
+    aspectRatio?: string;
+    onProgress?: (p: ComfyJobProgress) => void;
+  }): Promise<string> {
+    if (!this.settings.comfyConnected()) {
+      throw new Error(
+        'Local ComfyUI is not connected. Open Settings → Local ComfyUI to scan or enter a URL.'
+      );
+    }
+    const wf = this.settings.comfyImageWorkflowSelection();
+    let width: number | undefined;
+    let height: number | undefined;
+    if (opts.size && /^\d+x\d+$/i.test(opts.size)) {
+      const [w, h] = opts.size.toLowerCase().split('x').map(Number);
+      width = w;
+      height = h;
+    } else if (opts.aspectRatio === '16:9') {
+      width = 1280;
+      height = 720;
+    } else if (opts.aspectRatio === '1:1') {
+      width = 1024;
+      height = 1024;
+    } else if (opts.aspectRatio === '9:16') {
+      width = 720;
+      height = 1280;
+    }
+
+    try {
+      const boundImages = this.settings.comfyImagesWithBindings(
+        'image',
+        (opts.images || []).map((img) => ({
+          label: img.label,
+          data: img.data,
+          role: img.label as
+            | 'character_reference'
+            | 'style_reference'
+            | 'reference_0'
+            | 'start_frame'
+            | 'end_frame',
+        }))
+      );
+      const result = await this.runComfyJob(
+        {
+          kind: 'image',
+          prompt: opts.prompt,
+          images: boundImages,
+          width,
+          height,
+          models: this.settings.comfyModelsPayload('image'),
+          freeBeforeRun: this.settings.comfyImageFreeBeforeRun(),
+          ...wf,
+        },
+        opts.onProgress
+      );
+      if (result?.dataUrl) return result.dataUrl;
+      if (result?.data) {
+        const mime = result.mime || 'image/png';
+        return `data:${mime};base64,${result.data}`;
+      }
+      throw new Error(result?.error || 'No image returned from ComfyUI');
+    } catch (err) {
+      throw new Error(this.httpErrorMessage(err, 'ComfyUI image generation failed'));
+    }
+  }
+
+  /**
+   * Start async Comfy job and poll until done/error.
+   */
+  private async runComfyJob(
+    body: Record<string, unknown>,
+    onProgress?: (p: ComfyJobProgress) => void
+  ): Promise<{
+    dataUrl?: string;
+    data?: string;
+    mime?: string;
+    error?: string;
+    promptId?: string;
+  }> {
+    const start = await firstValueFrom(
+      this.http.post<{
+        jobId?: string;
+        async?: boolean;
+        error?: string;
+        dataUrl?: string;
+        data?: string;
+        mime?: string;
+      }>('/api/comfy/generate', { ...body, async: true })
+    );
+
+    // Legacy sync response (shouldn't happen with async:true)
+    if (!start?.jobId && (start?.dataUrl || start?.data)) {
+      return start;
+    }
+    if (!start?.jobId) {
+      throw new Error(start?.error || 'ComfyUI did not return a job id');
+    }
+
+    const jobId = start.jobId;
+    this.lastComfyJobId = jobId;
+    onProgress?.({ jobId, status: 'preparing', message: 'Starting…', percent: 1 });
+
+    // Must exceed server GENERATE_MAX_WAIT_MS (60m video) so the server error surfaces first
+    const maxWaitMs = 65 * 60 * 1000;
+    const started = Date.now();
+    while (Date.now() - started < maxWaitMs) {
+      await new Promise((r) => setTimeout(r, 450));
+      const job = await firstValueFrom(
+        this.http.get<ComfyJobProgress & {
+          result?: {
+            dataUrl?: string;
+            data?: string;
+            mime?: string;
+            promptId?: string;
+          };
+          error?: string | null;
+        }>(`/api/comfy/job/${encodeURIComponent(jobId)}`)
+      );
+
+      onProgress?.({
+        jobId,
+        status: job.status,
+        message: job.message,
+        percent: job.percent,
+        node: job.node,
+        nodeType: job.nodeType,
+        value: job.value,
+        max: job.max,
+        promptId: job.promptId,
+        error: job.error,
+      });
+
+      if (job.status === 'done' && job.result) {
+        return job.result;
+      }
+      if (job.status === 'error') {
+        throw new Error(job.error || job.message || 'ComfyUI job failed');
+      }
+    }
+    throw new Error(
+      'Timed out waiting for ComfyUI job (app poll limit). The server wait is up to 60 minutes for video — check ComfyUI for a stuck load.'
+    );
+  }
+
+  /** Last async Comfy job id (for cancel). */
+  private lastComfyJobId: string | null = null;
+
+  async cancelComfyJob(jobId?: string | null): Promise<void> {
+    const id = jobId || this.lastComfyJobId;
+    if (!id) return;
+    try {
+      await firstValueFrom(this.http.post(`/api/comfy/job/${encodeURIComponent(id)}/cancel`, {}));
+    } catch {
+      /* ignore */
+    }
   }
 
   private async generateImageOpenAI(
@@ -499,18 +680,26 @@ export class ApiService {
     }
     if (typeof body === 'object') {
       const o = body as Record<string, unknown>;
-      // xAI style: error is a string
+      // Our Comfy proxy: { error: "human string" }
       if (typeof o['error'] === 'string' && o['error'].trim()) {
-        return o['error'];
+        return o['error'].trim().slice(0, 800);
       }
+      // Nested { error: { message } } (Google / Comfy raw)
       if (o['error'] && typeof o['error'] === 'object') {
         const nested = o['error'] as Record<string, unknown>;
         if (typeof nested['message'] === 'string' && nested['message'].trim()) {
-          return nested['message'];
+          return nested['message'].trim().slice(0, 800);
+        }
+        // Avoid "[object Object]" — stringify useful fields
+        try {
+          const s = JSON.stringify(nested);
+          if (s && s !== '{}') return s.slice(0, 800);
+        } catch {
+          /* ignore */
         }
       }
       if (typeof o['message'] === 'string' && o['message'].trim()) {
-        return o['message'];
+        return o['message'].trim().slice(0, 800);
       }
     }
     return null;
@@ -524,21 +713,32 @@ export class ApiService {
     provider?: VideoProviderId;
     aspectRatio?: string;
     resolution?: string;
+    onProgress?: (p: ComfyJobProgress) => void;
   }): Promise<GeneratedVideo> {
     const sel = this.settings.videoProviderSelection();
     const id = opts.provider || sel.provider?.id;
     if (!id) {
       throw new Error(
-        'No video provider available. Add a Gemini or xAI (Grok) key — or log in with SuperGrok — in Settings.'
+        'No video provider available. Add a Gemini or xAI (Grok) key — log in with SuperGrok — or connect Local ComfyUI in Settings.'
       );
     }
     const def = VIDEO_PROVIDERS.find((p) => p.id === id);
     if (!def) throw new Error(`Unknown video provider: ${id}`);
 
-    if (opts.mode === 'keyframe' && !def.caps.supportsKeyframe) {
-      throw new Error(
-        `${def.label} does not support keyframe mode (start + end frames). Use Reference Mode instead.`
-      );
+    if (opts.mode === 'keyframe') {
+      if (def.keyProvider === 'comfy') {
+        // Comfy keyframe support is workflow-dependent (≥2 LoadImage nodes), not a fixed catalog flag.
+        const slots = this.settings.comfyVideoImageSlots().length;
+        if (slots < 2) {
+          throw new Error(
+            `This ComfyUI workflow has ${slots} image input(s). Keyframe mode needs at least two LoadImage nodes (start + end). Pick a dual-image workflow or use Reference Mode.`
+          );
+        }
+      } else if (!def.caps.supportsKeyframe) {
+        throw new Error(
+          `${def.label} does not support keyframe mode (start + end frames). Use Reference Mode instead.`
+        );
+      }
     }
 
     if (def.keyProvider === 'google') {
@@ -547,7 +747,79 @@ export class ApiService {
     if (def.keyProvider === 'xai') {
       return this.generateVideoXai(opts, def.modelId);
     }
+    if (def.keyProvider === 'comfy') {
+      return this.generateVideoComfy(opts);
+    }
     throw new Error(`Unsupported video provider: ${id}`);
+  }
+
+  private async generateVideoComfy(opts: {
+    // onProgress forwarded from generateVideo
+    prompt: string;
+    mode: 'reference' | 'keyframe';
+    referenceDataUrls: string[];
+    duration: number;
+    aspectRatio?: string;
+    onProgress?: (p: ComfyJobProgress) => void;
+  }): Promise<GeneratedVideo> {
+    if (!this.settings.comfyConnected()) {
+      throw new Error(
+        'Local ComfyUI is not connected. Open Settings → Local ComfyUI to scan or enter a URL.'
+      );
+    }
+    const wf = this.settings.comfyVideoWorkflowSelection();
+    // Reference mode → reference_0 (+ end_frame only if a 2nd image is provided).
+    // Keyframe mode → start_frame / end_frame. Do not alias both to the same role.
+    const rawItems =
+      opts.mode === 'keyframe'
+        ? (opts.referenceDataUrls || []).map((data, i) => ({
+            label: i === 0 ? 'start_frame' : i === 1 ? 'end_frame' : `ref_${i}`,
+            data,
+            role: (i === 0 ? 'start_frame' : i === 1 ? 'end_frame' : 'reference_0') as
+              | 'start_frame'
+              | 'end_frame'
+              | 'reference_0',
+          }))
+        : (opts.referenceDataUrls || []).map((data, i) => ({
+            label: i === 0 ? 'reference_0' : i === 1 ? 'end_frame' : `ref_${i}`,
+            data,
+            role: (i === 0 ? 'reference_0' : i === 1 ? 'end_frame' : 'reference_0') as
+              | 'reference_0'
+              | 'end_frame',
+          }));
+    const images = this.settings.comfyImagesWithBindings('video', rawItems);
+
+    try {
+      const data = await this.runComfyJob(
+        {
+          kind: 'video',
+          prompt: opts.prompt,
+          images,
+          // Do not force canvas size into video graphs — leaves workflow latent/model dims intact.
+          applySize: false,
+          models: this.settings.comfyModelsPayload('video'),
+          freeBeforeRun: this.settings.comfyVideoFreeBeforeRun(),
+          ...wf,
+        },
+        opts.onProgress
+      );
+
+      const mime = data?.mime || 'video/mp4';
+      let b64 = data?.data;
+      if (!b64 && data?.dataUrl?.includes(',')) {
+        b64 = data.dataUrl.split(',')[1];
+      }
+      if (!b64) throw new Error(data?.error || 'No video returned from ComfyUI');
+
+      const blob = base64ToBlob(b64, mime);
+      const typed =
+        blob.type && (blob.type.startsWith('video/') || blob.type === 'image/gif' || blob.type === 'image/webp')
+          ? blob
+          : new Blob([blob], { type: mime });
+      return { blob: typed, url: URL.createObjectURL(typed) };
+    } catch (err) {
+      throw new Error(this.httpErrorMessage(err, 'ComfyUI video generation failed'));
+    }
   }
 
   /**

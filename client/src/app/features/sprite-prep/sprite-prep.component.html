@@ -144,17 +144,53 @@
           />
         </div>
         <div class="form-row">
-          <label>Character Description</label>
-          <textarea rows="3" [(ngModel)]="charDesc" placeholder="Blue hair, red cape..."></textarea>
-        </div>
-        <div class="form-row">
           <label>Character Action <span class="text-dim">(optional)</span></label>
           <input type="text" [(ngModel)]="charAction" placeholder="e.g. waving hello" />
         </div>
+
         <div class="form-row">
-          <label>Race Mode</label>
-          <app-mode-selector [options]="raceOptions" [value]="raceMode()" (valueChange)="raceMode.set($event)" />
+          <div class="flex items-center gap-sm" style="flex-wrap: wrap">
+            <label class="toggle-switch" title="Skip the built-in sprite prompt (framing, chroma, race) and use your own text after name + action">
+              <input
+                type="checkbox"
+                [checked]="useCustomPrompt()"
+                (change)="onUseCustomPromptToggle($event)"
+              />
+              <span class="slider"></span>
+            </label>
+            <label style="margin-bottom: 0">Custom prompt</label>
+            <span class="text-dim" style="font-size: 0.72rem">
+              for SDXL tags / freeform — still uses name + action
+            </span>
+          </div>
         </div>
+
+        @if (useCustomPrompt()) {
+          <div class="form-row">
+            <label>Custom prompt text</label>
+            <textarea
+              rows="6"
+              [ngModel]="customPrompt"
+              (ngModelChange)="onCustomPromptChange($event)"
+              placeholder="1girl, blue hair, red cape, masterpiece, best quality, …&#10;(Name + action are prepended automatically; no chroma/framing boilerplate.)"
+              class="custom-prompt-ta"
+            ></textarea>
+            <div class="text-dim mt-1" style="font-size: 0.72rem">
+              Final shape:
+              <code>A single {{ genCharName.trim() || 'Name' }}, {{ charAction.trim() || 'standing in a neutral idle position' }}.</code>
+              then your text below. Description, race mode, and pipeline framing/chroma are not added.
+            </div>
+          </div>
+        } @else {
+          <div class="form-row">
+            <label>Character Description</label>
+            <textarea rows="3" [(ngModel)]="charDesc" placeholder="Blue hair, red cape..."></textarea>
+          </div>
+          <div class="form-row">
+            <label>Race Mode</label>
+            <app-mode-selector [options]="raceOptions" [value]="raceMode()" (valueChange)="raceMode.set($event)" />
+          </div>
+        }
       </div>
 
       <div class="glass-panel">
@@ -177,18 +213,31 @@
               </div>
             }
           </div>
-          <div class="form-row">
-            <label>Art Style Reference</label>
+          <div class="form-row" [class.dimmed-ref]="!styleRefEnabled()">
+            <label>
+              Art Style Reference
+              @if (!styleRefEnabled()) {
+                <span class="text-dim" style="font-weight: 400; font-size: 0.72rem">
+                  (workflow has only one image input)
+                </span>
+              }
+            </label>
             <app-upload-zone
               accept="image/*"
               icon="🎨"
               text="Style Reference"
               [compact]="true"
-              [forceContent]="!!styleRefBase64()"
+              [hidden]="!styleRefEnabled()"
+              [forceContent]="!!styleRefBase64() && styleRefEnabled()"
               (filesSelected)="onStyleRef($event)"
               (cleared)="clearStyleRef()"
             />
-            @if (styleRefBase64()) {
+            @if (!styleRefEnabled()) {
+              <div class="text-dim mt-1" style="font-size: 0.72rem">
+                This Comfy workflow only has one LoadImage node. Character reference is used;
+                assign it under Local ComfyUI → Image inputs. Pick a two-image workflow for style + character.
+              </div>
+            } @else if (styleRefBase64()) {
               <div class="mt-1">
                 <img [src]="styleRefBase64()!" style="max-width: 100%; border-radius: var(--radius); border: 1px solid var(--border)" />
               </div>
@@ -301,9 +350,18 @@
         </button>
 
         <div class="progress-container" [class.active]="generating()">
-          <div class="progress-bar"><div class="fill" style="width: 60%"></div></div>
+          <div class="progress-bar">
+            <div
+              class="fill"
+              [class.indeterminate]="genProgress() < 0"
+              [style.width.%]="genProgress() < 0 ? 40 : genProgress()"
+            ></div>
+          </div>
           <div class="progress-text">
-            <span>Generating...</span>
+            <span>{{ genStatus()?.type === 'info' ? genStatus()!.text : 'Generating…' }}</span>
+            @if (genProgress() >= 0) {
+              <span class="text-dim" style="margin-left: 0.35rem">{{ genProgress() }}%</span>
+            }
             <button type="button" class="btn btn-sm btn-danger" (click)="cancelGenerate()">Cancel</button>
           </div>
         </div>
@@ -361,31 +419,35 @@
     </div>
 
     <aside class="main-layout-sidebar">
-      <div class="glass-panel">
-        <div class="panel-title"><span class="title-icon">ℹ️</span> About AI Generate</div>
-        <div class="panel-subtitle">
-          Describe your character, pick a race mode, and optionally attach references. Online image models return
-          chroma-keyed sprites ready for video animation and export. Generate one or several options, then
-          <strong>Select</strong> a single result to continue the pipeline.
+      @if (usingComfyImage()) {
+        <app-comfy-options-panel kind="image" [activeRoles]="comfyActiveRoles()" />
+      } @else {
+        <div class="glass-panel">
+          <div class="panel-title"><span class="title-icon">ℹ️</span> About AI Generate</div>
+          <div class="panel-subtitle">
+            Describe your character, pick a race mode, and optionally attach references. Online image models return
+            chroma-keyed sprites ready for video animation and export. Generate one or several options, then
+            <strong>Select</strong> a single result to continue the pipeline.
+          </div>
+          <div class="panel-subtitle mt-1">
+            <strong class="text-gold">Why GPT Image 2 is the default:</strong> it stays most coherent with the three race
+            prompts (Normal / Kanolith / Zoalith) and places characters more reliably in frame for VTuber-style
+            sprites—full figure, solid key background, and pose that holds up when you animate later.
+          </div>
+          <div class="panel-subtitle mt-1">
+            After you select a result, use the <strong>frame editor</strong> (drag, rotate, zoom) to fine-tune placement
+            on the pipeline canvas before sending it downstream.
+          </div>
+          <div class="panel-subtitle mt-1">
+            Gemini Image, Grok Imagine, and Local ComfyUI remain available when you prefer those providers.
+            Set keys or SuperGrok login under <strong>Settings</strong>.
+          </div>
+          <div class="settings-info">
+            <span class="info-icon">🎨</span>
+            Prefer your own art? Switch to <strong>Manual Upload</strong> — no API key required.
+          </div>
         </div>
-        <div class="panel-subtitle mt-1">
-          <strong class="text-gold">Why GPT Image 2 is the default:</strong> it stays most coherent with the three race
-          prompts (Normal / Kanolith / Zoalith) and places characters more reliably in frame for VTuber-style
-          sprites—full figure, solid key background, and pose that holds up when you animate later.
-        </div>
-        <div class="panel-subtitle mt-1">
-          After you select a result, use the <strong>frame editor</strong> (drag, rotate, zoom) to fine-tune placement
-          on the pipeline canvas before sending it downstream.
-        </div>
-        <div class="panel-subtitle mt-1">
-          Gemini Image and Grok Imagine (API key or SuperGrok OAuth) remain available when you prefer those providers.
-          Set keys or SuperGrok login under <strong>Settings</strong>.
-        </div>
-        <div class="settings-info">
-          <span class="info-icon">🎨</span>
-          Prefer your own art? Switch to <strong>Manual Upload</strong> — no API key required.
-        </div>
-      </div>
+      }
     </aside>
   </div>
 }

@@ -21,6 +21,7 @@ import { ColorSwatchesComponent } from '../../shared/components/color-swatches.c
 import { UploadZoneComponent } from '../../shared/components/upload-zone.component';
 import { ModeSelectorComponent } from '../../shared/components/mode-selector.component';
 import { GenCountComponent } from '../../shared/components/gen-count.component';
+import { ComfyOptionsPanelComponent } from '../../shared/components/comfy-options-panel.component';
 import {
   IMAGE_PROVIDERS,
   type ImageProviderId,
@@ -54,6 +55,7 @@ import { SpriteFrameEditorComponent } from './sprite-frame-editor.component';
     ModeSelectorComponent,
     GenCountComponent,
     SpriteFrameEditorComponent,
+    ComfyOptionsPanelComponent,
   ],
   templateUrl: './sprite-prep.component.html',
 })
@@ -88,13 +90,17 @@ export class SpritePrepComponent implements AfterViewInit, OnDestroy {
   readonly imageProviderNote = computed(() => {
     const sel = this.settings.imageProviderSelection();
     if (!sel.provider) {
-      return 'No image providers ready. Add an OpenAI, Gemini, or xAI key — or log in with SuperGrok — in Settings.';
+      return 'No image providers ready. Add an OpenAI, Gemini, or xAI key — log in with SuperGrok — or connect Local ComfyUI in Settings.';
     }
     if (sel.fellBack) {
       return `Using ${sel.provider.label} (fallback — preferred provider has no API key).`;
     }
     if (sel.provider.keyProvider === 'xai') {
       return `${sel.provider.label} via ${this.settings.xaiBackendLabel()} · configure in Settings`;
+    }
+    if (sel.provider.keyProvider === 'comfy') {
+      const name = this.settings.comfyImageSelectionLabel() || 'workflow not selected';
+      return `${sel.provider.label} · ${this.settings.comfyBaseUrl() || 'connected'} · ${name}`;
     }
     if (sel.provider.recommended) {
       return `${sel.provider.label} · recommended for sprites`;
@@ -105,6 +111,20 @@ export class SpritePrepComponent implements AfterViewInit, OnDestroy {
   readonly selectedImageProvider = computed(
     () => this.settings.imageProviderSelection().provider?.id ?? ''
   );
+
+  /** Local ComfyUI selected as image provider. */
+  readonly usingComfyImage = computed(
+    () => this.settings.imageProviderSelection().provider?.keyProvider === 'comfy'
+  );
+
+  /**
+   * Style reference is only useful when the workflow (or cloud model) can take 2 images.
+   * For Comfy: disable when 0–1 LoadImage slots.
+   */
+  readonly styleRefEnabled = computed(() => {
+    if (!this.usingComfyImage()) return true;
+    return this.settings.comfyImageImageSlots().length >= 2;
+  });
 
   readonly recommendedImageProviderLabel =
     IMAGE_PROVIDERS.find((p) => p.recommended)?.label ?? 'GPT Image 2';
@@ -128,6 +148,13 @@ export class SpritePrepComponent implements AfterViewInit, OnDestroy {
     { value: 'zoalith', label: '🐲 Zoalith', title: 'Full anthropomorphic beastfolk' },
   ];
 
+  /**
+   * When true, skip the full sprite pipeline prompt (race, chroma, framing, etc.)
+   * and use {@link customPrompt} after Character Name + Action only.
+   */
+  readonly useCustomPrompt = signal(localStorage.getItem('as_sprite_custom_prompt') === 'true');
+  customPrompt = localStorage.getItem('as_sprite_custom_prompt_text') ?? '';
+
   characterName = this.pipeline.characterName();
   genCharName = this.pipeline.characterName();
   charDesc = '';
@@ -142,11 +169,22 @@ export class SpritePrepComponent implements AfterViewInit, OnDestroy {
 
   readonly genCount = signal(1);
   readonly generating = signal(false);
+  /** 0–100 for Comfy (and future) live progress; -1 = indeterminate. */
+  readonly genProgress = signal(-1);
   readonly genStatus = signal<{ type: string; text: string } | null>(null);
   readonly genResults = signal<string[]>([]);
   readonly selectedResult = signal<string | null>(null);
   readonly charRefBase64 = signal<string | null>(null);
   readonly styleRefBase64 = signal<string | null>(null);
+
+  /** Comfy LoadImage roles that currently have an uploaded app image. */
+  readonly comfyActiveRoles = computed(() => {
+    const roles: Array<'character_reference' | 'style_reference'> = [];
+    if (this.charRefBase64()) roles.push('character_reference');
+    if (this.styleRefBase64() && this.styleRefEnabled()) roles.push('style_reference');
+    return roles;
+  });
+
   readonly showAdvKey = signal(false);
   readonly advKeyResults = signal<
     Array<{
@@ -308,22 +346,41 @@ export class SpritePrepComponent implements AfterViewInit, OnDestroy {
     const dataUrl = await fileToDataUrl(files[0]);
     this.charRefBase64.set(dataUrl);
     await this.analyzeReference(dataUrl);
+    if (this.usingComfyImage()) {
+      this.settings.ensureComfyImageBinding('image', 'character_reference');
+    }
     this.toast.show('Character reference loaded — key color auto-detected', 'info');
   }
 
   clearCharRef(): void {
     this.charRefBase64.set(null);
+    if (this.usingComfyImage()) {
+      this.settings.clearComfyImageBinding('image', 'character_reference');
+    }
     this.toast.show('Character reference cleared', 'info');
   }
 
   async onStyleRef(files: FileList): Promise<void> {
     if (!files[0]) return;
+    if (!this.styleRefEnabled()) {
+      this.toast.show(
+        'This Comfy workflow only has one image input — style reference is disabled.',
+        'warning'
+      );
+      return;
+    }
     this.styleRefBase64.set(await fileToDataUrl(files[0]));
+    if (this.usingComfyImage()) {
+      this.settings.ensureComfyImageBinding('image', 'style_reference');
+    }
     this.toast.show('Style reference loaded', 'info');
   }
 
   clearStyleRef(): void {
     this.styleRefBase64.set(null);
+    if (this.usingComfyImage()) {
+      this.settings.clearComfyImageBinding('image', 'style_reference');
+    }
     this.toast.show('Style reference cleared', 'info');
   }
 
@@ -343,13 +400,38 @@ export class SpritePrepComponent implements AfterViewInit, OnDestroy {
     if (scores) this.applyScores(scores);
   }
 
+  setUseCustomPrompt(enabled: boolean): void {
+    this.useCustomPrompt.set(enabled);
+    localStorage.setItem('as_sprite_custom_prompt', String(enabled));
+  }
+
+  onUseCustomPromptToggle(e: Event): void {
+    this.setUseCustomPrompt((e.target as HTMLInputElement).checked);
+  }
+
+  onCustomPromptChange(text: string): void {
+    this.customPrompt = text;
+    localStorage.setItem('as_sprite_custom_prompt_text', text);
+  }
+
+  /**
+   * Built pipeline prompt, or custom override:
+   * `A single {name}, {action}.` + raw user prompt (no race/chroma/framing boilerplate).
+   */
   private buildPrompt(): string {
     const name = this.genCharName.trim() || 'Character';
-    const desc = this.charDesc.trim();
     const action = this.charAction.trim();
+    const actionText = action || 'standing in a neutral idle position';
+
+    if (this.useCustomPrompt()) {
+      const raw = this.customPrompt.trim();
+      // Name + action only, then the user's tagging / freeform prompt as-is.
+      return [`A single ${name}, ${actionText}.`, raw].filter(Boolean).join('\n');
+    }
+
+    const desc = this.charDesc.trim();
     const keyHex = this.keyColor();
     const keyName = colorName(keyHex);
-    const actionText = action || 'standing in a neutral idle position';
 
     let raceDirective = '';
     if (this.raceMode() === 'kanolith') {
@@ -451,10 +533,14 @@ export class SpritePrepComponent implements AfterViewInit, OnDestroy {
       this.toast.show('Please enter a character name', 'warning');
       return;
     }
+    if (this.useCustomPrompt() && !this.customPrompt.trim()) {
+      this.toast.show('Enter a custom prompt, or turn off Custom Prompt mode', 'warning');
+      return;
+    }
     const sel = this.settings.imageProviderSelection();
     if (!sel.provider) {
       this.toast.show(
-        'Add an OpenAI, Gemini, or xAI key — or log in with SuperGrok — in Settings first',
+        'Add an OpenAI, Gemini, or xAI key — log in with SuperGrok — or connect Local ComfyUI in Settings first',
         'warning'
       );
       return;
@@ -464,6 +550,7 @@ export class SpritePrepComponent implements AfterViewInit, OnDestroy {
 
     this.generating.set(true);
     this.genCancelled = false;
+    this.genProgress.set(sel.provider.keyProvider === 'comfy' ? 0 : -1);
     this.genStatus.set({
       type: 'info',
       text: `Generating sprite with ${sel.provider.label} — this may take up to a minute…`,
@@ -472,8 +559,12 @@ export class SpritePrepComponent implements AfterViewInit, OnDestroy {
     try {
       const prompt = this.buildPrompt();
       const images: { label: string; data: string }[] = [];
-      if (this.charRefBase64()) images.push({ label: 'character_reference', data: this.charRefBase64()! });
-      if (this.styleRefBase64()) images.push({ label: 'style_reference', data: this.styleRefBase64()! });
+      if (this.charRefBase64()) {
+        images.push({ label: 'character_reference', data: this.charRefBase64()! });
+      }
+      if (this.styleRefBase64() && this.styleRefEnabled()) {
+        images.push({ label: 'style_reference', data: this.styleRefBase64()! });
+      }
 
       const format = {
         size: this.imageSizeOptions().length ? this.imageSize() : undefined,
@@ -484,12 +575,25 @@ export class SpritePrepComponent implements AfterViewInit, OnDestroy {
       const promises: Promise<string>[] = [];
       for (let i = 0; i < this.genCount(); i++) {
         if (this.genCancelled) break;
+        const idx = i;
         promises.push(
           this.api.generateImage({
             prompt,
             images,
             provider: sel.provider.id,
             ...format,
+            onProgress: (p) => {
+              if (this.genCancelled) return;
+              const label =
+                this.genCount() > 1 ? `[${idx + 1}/${this.genCount()}] ` : '';
+              this.genStatus.set({
+                type: 'info',
+                text: `${label}${p.message || 'Working…'}`,
+              });
+              if (typeof p.percent === 'number' && p.percent >= 0) {
+                this.genProgress.set(Math.min(100, p.percent));
+              }
+            },
           })
         );
       }
@@ -528,12 +632,16 @@ export class SpritePrepComponent implements AfterViewInit, OnDestroy {
       this.genStatus.set({ type: 'error', text: `❌ ${(err as Error).message}` });
     } finally {
       this.generating.set(false);
+      this.genProgress.set(-1);
     }
   }
 
   cancelGenerate(): void {
     this.genCancelled = true;
+    void this.api.cancelComfyJob();
     this.toast.show('Generation cancelled', 'warning');
+    this.generating.set(false);
+    this.genProgress.set(-1);
   }
 
   selectResult(dataUrl: string): void {
