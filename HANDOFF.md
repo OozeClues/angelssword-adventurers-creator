@@ -282,7 +282,7 @@ Crafted with ✦ for adventurers everywhere
 
 **Port**: 3000 (or configurable)
 
-**Static file serving**: Serve from `public/` directory
+**Static file serving**: Serve Angular `client/dist` (or packaged `www/`). Vanilla UI is under `legacy/public/` (reference only).
 
 **API Proxy Routes**:
 | Route | Proxies To | Purpose |
@@ -371,14 +371,13 @@ H:\Git\devtools\AS Adventurer\
 ├── server.js                 # Node.js server + API proxy
 ├── package.json              # Dependencies (express, node-fetch, form-data)
 ├── Start ASAdventurer.bat    # Launcher
-├── public/
-│   ├── index.html            # Single-page app
-│   ├── style.css             # Design system + all component styles
-│   ├── app.js                # Main app controller, tab switching, settings
-│   ├── sprite-prep.js        # Tab 1: Sprite Prep (manual + generative)
-│   ├── video-gen.js          # Tab 2: Generate Video (Omni Flash)
-│   ├── video-prep.js         # Tab 3: Video Preparation (loop builder + concat)
-│   ├── model-exporter.js     # Tab 4: Model Exporter (chroma key + export)
-│   └── assets/
-│       └── (favicon, mascot, sounds, references)
+├── client/                   # Angular app (active UI)
+│   └── public/               # Active static assets (logo, sounds, favicon)
+├── legacy/                   # Vanilla UI snapshots (reference only)
+│   ├── public/               # Complete former root public/ tree
+│   │   ├── index.html
+│   │   ├── style.css
+│   │   ├── app.js · sprite-prep.js · video-gen.js · video-prep.js · model-exporter.js
+│   │   └── assets/
+│   └── vanilla/              # Alternate script snapshot (ex-legacy-vanilla)
 ```

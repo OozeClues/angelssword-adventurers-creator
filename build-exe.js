@@ -266,10 +266,10 @@ function copyDirSync(src, dest) {
 }
 
 function findUiRoot() {
+  // Active UI only — legacy/public is reference vanilla, not packaged.
   const candidates = [
     path.join(ROOT, 'client', 'dist', 'client', 'browser'),
     path.join(ROOT, 'client', 'dist', 'browser'),
-    path.join(ROOT, 'public'),
   ];
   return candidates.find((p) => fs.existsSync(path.join(p, 'index.html'))) || null;
 }
@@ -983,7 +983,7 @@ function ensureClientBuilt(skipClient) {
     try {
       execSync('npm run build --prefix client', { stdio: 'inherit', cwd: ROOT });
     } catch {
-      log('Client build failed — will try existing dist or public/');
+      log('Client build failed — will try existing client/dist if present');
     }
   } else if (skipClient) {
     log('Skipping client build (--skip-client-build)');
@@ -1024,7 +1024,11 @@ function buildZipRelease(target, targetKey, opts = {}) {
 
   const uiRoot = findUiRoot();
   if (!uiRoot) {
-    console.error('\n  ❌ No UI found. Build the client or ensure public/index.html exists.\n');
+    console.error(
+      '\n  ❌ No UI found. Build the Angular client first:\n' +
+        '     npm run build --prefix client\n' +
+        '     (legacy/public is reference-only and is not packaged)\n'
+    );
     process.exit(1);
   }
   log(`UI: ${path.relative(ROOT, uiRoot)}`);
@@ -1177,7 +1181,11 @@ function buildAllReleases(skipClient, withFlatpaks) {
   ensureClientBuilt(skipClient);
   const uiRoot = findUiRoot();
   if (!uiRoot) {
-    console.error('\n  ❌ No UI found. Build the client or ensure public/index.html exists.\n');
+    console.error(
+      '\n  ❌ No UI found. Build the Angular client first:\n' +
+        '     npm run build --prefix client\n' +
+        '     (legacy/public is reference-only and is not packaged)\n'
+    );
     process.exit(1);
   }
 

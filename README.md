@@ -152,7 +152,7 @@ This repository is based on [AngelsSwordStudios/angelssword-adventurers-creator]
 
 - **Angular** SPA under `client/` (primary UI) instead of a single vanilla `public/` app
 - Express **`server.js`** still proxies AI + hosts static/export; production builds embed the Angular `www/` bundle
-- **Legacy** vanilla sources kept under `public/` and `legacy-vanilla/` for reference (not the main UI path)
+- **Legacy** vanilla sources kept under `legacy/public/` and `legacy/vanilla/` for reference only (not served or packaged)
 
 ### AI / providers
 
@@ -220,7 +220,9 @@ angelssword-adventurers-creator/
 │   └── README.md
 ├── scripts/                  # ensure-ffmpeg, dev-client, build helpers
 ├── flatpak/                  # Flatpak packaging
-├── public/ · legacy-vanilla/ # Older vanilla UI snapshots
+├── legacy/                   # Vanilla UI snapshots (reference only; see legacy/README.md)
+│   ├── public/               # Complete former root public/ tree
+│   └── vanilla/              # Alternate script snapshot (ex-legacy-vanilla)
 ├── bin/                      # Bundled ffmpeg (after ensure-ffmpeg / package)
 └── dist/                     # Release outputs
 ```

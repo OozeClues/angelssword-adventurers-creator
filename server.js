@@ -2,7 +2,7 @@
  * ⚔️ AS Adventurer — Local Server + API Proxy
  * Angel's Sword Studios
  * 
- * Serves static files from public/ and proxies API requests
+ * Serves static UI (www/ or Angular client dist) and proxies API requests
  * to OpenAI and Google Gemini to avoid CORS issues and protect API keys.
  */
 
@@ -129,18 +129,23 @@ app.use((req, res, next) => {
     next();
 });
 
-// Static files — pkg release uses www/ next to the binary; dev uses client dist or public/
+// Static files — pkg release uses www/ next to the binary; dev uses Angular client dist.
+// Vanilla UI snapshots live under legacy/ and are not served here.
 const APP_DIR = process.pkg ? path.dirname(process.execPath) : __dirname;
 const staticCandidates = [
     path.join(APP_DIR, 'www'),
     path.join(APP_DIR, 'client', 'dist', 'client', 'browser'),
     path.join(APP_DIR, 'client', 'dist', 'browser'),
-    path.join(APP_DIR, 'public'),
 ];
-const staticRoot =
-    staticCandidates.find((p) => fs.existsSync(path.join(p, 'index.html'))) ||
-    path.join(APP_DIR, 'public');
-app.use(express.static(staticRoot));
+const staticRoot = staticCandidates.find((p) => fs.existsSync(path.join(p, 'index.html')));
+if (!staticRoot) {
+    console.warn(
+        '  [static] No UI found (www/ or client/dist). Run: npm run build --prefix client\n' +
+            '           Legacy vanilla UI is under legacy/public/ (reference only).'
+    );
+} else {
+    app.use(express.static(staticRoot));
+}
 
 // --- API Proxy Routes ---
 
@@ -1279,6 +1284,14 @@ app.post(
 // SPA fallback (Angular client routes)
 app.get('*', (req, res, next) => {
     if (req.path.startsWith('/api/')) return next();
+    if (!staticRoot) {
+        return res
+            .status(404)
+            .send(
+                'UI not found. Build the client (npm run build --prefix client) or use a release package. ' +
+                    'Legacy vanilla UI is under legacy/public/ (reference only).'
+            );
+    }
     const indexPath = path.join(staticRoot, 'index.html');
     if (fs.existsSync(indexPath)) {
         return res.sendFile(indexPath);
@@ -1292,7 +1305,7 @@ app.listen(PORT, () => {
     console.log('  ⚔️  AS Adventurer — VTuber Creation Pipeline');
     console.log('  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
     console.log(`  Server running at http://localhost:${PORT}`);
-    console.log(`  Static root: ${staticRoot}`);
+    console.log(`  Static root: ${staticRoot || '(none — build client/dist or use www/)'}`);
 
     probeFfmpeg().then((p) => {
         if (p.available) {
