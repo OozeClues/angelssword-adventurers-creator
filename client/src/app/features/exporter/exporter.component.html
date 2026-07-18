@@ -67,29 +67,21 @@
 
                             <hr class="gold-divider">
 
-                            <!-- Key Color -->
+                            <!-- Key Color: presets + themed picker (inline) + canvas eyedropper + auto -->
                             <div class="form-row">
                                 <label>Key Color</label>
-                                <div class="flex items-center gap-sm">
-                                    <div class="color-swatches" id="exColorSwatches">
-                                        <div class="color-swatch selected" data-color="#00FF00" style="background:#00FF00" title="Green">
-                                            <span class="swatch-badge">Green</span>
-                                        </div>
-                                        <div class="color-swatch" data-color="#FF00FF" style="background:#FF00FF" title="Magenta">
-                                            <span class="swatch-badge">Magenta</span>
-                                        </div>
-                                        <div class="color-swatch" data-color="#0000FF" style="background:#0000FF" title="Blue">
-                                            <span class="swatch-badge">Blue</span>
-                                        </div>
-                                        <div class="color-swatch" data-color="#FFFF00" style="background:#FFFF00" title="Yellow">
-                                            <span class="swatch-badge">Yellow</span>
-                                        </div>
-                                        <div class="color-swatch" data-color="#00FFFF" style="background:#00FFFF" title="Cyan">
-                                            <span class="swatch-badge">Cyan</span>
-                                        </div>
-                                    </div>
-                                    <button class="eyedropper-btn" id="exEyedropper" title="Pick key color from the video frame">💧</button>
-                                    <button class="btn btn-sm btn-secondary" id="exAutoDetect" title="Auto-detect the best key color from the video">Auto</button>
+                                <div class="export-key-color-row">
+                                    <app-color-swatches
+                                        [color]="exportKeyColor()"
+                                        (colorChange)="onExportKeyColor($event)"
+                                        [enableSystemEyedropper]="true"
+                                        (eyedropperError)="onEyedropperError($event)"
+                                    />
+                                    <button type="button" class="eyedropper-btn" id="exEyedropper" title="Pick key color from the video frame">💧</button>
+                                    <button type="button" class="btn btn-sm btn-secondary" id="exAutoDetect" title="Auto-detect the best key color from the video">Auto</button>
+                                </div>
+                                <div class="text-dim mt-1" style="font-size: 0.7rem">
+                                    Presets or the color picker (HSV / RGB / hex). Use 💧 to sample from the frame above, or Auto to detect from edges.
                                 </div>
                             </div>
 

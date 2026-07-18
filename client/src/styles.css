@@ -926,6 +926,16 @@ input[type="range"]::-moz-range-thumb {
     display: flex;
     gap: 8px;
     flex-wrap: wrap;
+    align-items: center;
+}
+
+/* Legacy / export: swatches + picker + tools on one horizontal flow */
+.key-color-picker .key-color-row,
+.export-key-color-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.65rem 0.75rem;
 }
 
 .color-swatch {

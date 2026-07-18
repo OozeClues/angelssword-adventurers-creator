@@ -14,36 +14,37 @@ import { hexToRgb, normalizeHex } from '../utils/color-math';
   imports: [ColorPickerComponent],
   template: `
     <div class="key-color-picker">
-      <div class="color-swatches">
-        @for (c of colors; track c.hex) {
-          <div
-            class="color-swatch"
-            [class.selected]="normalized() === c.hex"
-            [style.background]="c.hex"
-            [attr.title]="c.name"
-            (click)="select(c.hex)"
-          >
-            <span
-              class="swatch-badge"
-              [class.best]="badgeFor(c.hex) === 'best'"
-              [class.avoid]="badgeFor(c.hex) === 'avoid'"
+      <!-- Swatches + picker flow on one row (picker sits in free space to the right) -->
+      <div class="key-color-row">
+        <div class="color-swatches">
+          @for (c of colors; track c.hex) {
+            <div
+              class="color-swatch"
+              [class.selected]="normalized() === c.hex"
+              [style.background]="c.hex"
+              [attr.title]="c.name"
+              (click)="select(c.hex)"
             >
-              {{ badgeLabel(c.hex, c.name) }}
-            </span>
-          </div>
-        }
-        @if (isCustom()) {
-          <div
-            class="color-swatch selected color-swatch-custom"
-            [style.background]="normalized()"
-            title="Custom key color"
-          >
-            <span class="swatch-badge">Custom</span>
-          </div>
-        }
-      </div>
+              <span
+                class="swatch-badge"
+                [class.best]="badgeFor(c.hex) === 'best'"
+                [class.avoid]="badgeFor(c.hex) === 'avoid'"
+              >
+                {{ badgeLabel(c.hex, c.name) }}
+              </span>
+            </div>
+          }
+          @if (isCustom()) {
+            <div
+              class="color-swatch selected color-swatch-custom"
+              [style.background]="normalized()"
+              title="Custom key color"
+            >
+              <span class="swatch-badge">Custom</span>
+            </div>
+          }
+        </div>
 
-      <div class="key-color-custom-row">
         <app-color-picker
           [color]="normalized()"
           (colorChange)="select($event)"
@@ -65,16 +66,23 @@ import { hexToRgb, normalizeHex } from '../utils/color-math';
       .key-color-picker {
         display: flex;
         flex-direction: column;
-        gap: 0.5rem;
+        gap: 0.35rem;
       }
-      .key-color-custom-row {
+      .key-color-row {
         display: flex;
         flex-wrap: wrap;
         align-items: center;
-        gap: 0.65rem;
+        gap: 0.65rem 0.75rem;
+      }
+      .key-color-row .color-swatches {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        align-items: center;
       }
       .key-color-rgb {
         font-size: 0.7rem;
+        white-space: nowrap;
       }
       .color-swatch-custom {
         box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.2);

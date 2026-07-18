@@ -1,14 +1,31 @@
-import { AfterViewInit, Component, OnDestroy, effect, inject } from '@angular/core';
+import { AfterViewInit, Component, OnDestroy, computed, effect, inject } from '@angular/core';
 import { PipelineStateService } from '../../core/pipeline-state.service';
 import { ToastService } from '../../core/toast.service';
 import { NotificationSoundService } from '../../core/notification-sound.service';
 import { debounce, hexToRgb } from '../../shared/utils/media';
+import { ColorSwatchesComponent } from '../../shared/components/color-swatches.component';
 import { initColorSwatches, initModeSelector, initUploadZone } from './dom-bridge';
 import { ModelExporter, setExporterHooks } from './model-exporter.engine';
 
 @Component({
   selector: 'app-exporter',
+  imports: [ColorSwatchesComponent],
   templateUrl: './exporter.component.html',
+  styles: [
+    `
+      .export-key-color-row {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 0.65rem 0.75rem;
+      }
+      /* Swatches component already lays out picker inline; keep tools beside it */
+      .export-key-color-row app-color-swatches {
+        display: block;
+        min-width: 0;
+      }
+    `,
+  ],
 })
 export class ExporterComponent implements AfterViewInit, OnDestroy {
   private readonly pipeline = inject(PipelineStateService);
@@ -17,6 +34,9 @@ export class ExporterComponent implements AfterViewInit, OnDestroy {
   private exporter: ModelExporter | null = null;
   /** Last videoPrepHandoffVersion applied to the engine (avoids reload loops). */
   private lastAppliedPrepVersion = 0;
+
+  /** Bound to app-color-swatches (pipeline key color is source of truth). */
+  readonly exportKeyColor = computed(() => this.pipeline.keyColor() || '#00FF00');
 
   /** Mutable bag the legacy engine observes via defineProperty. */
   private readonly handoffBag: {
@@ -92,5 +112,17 @@ export class ExporterComponent implements AfterViewInit, OnDestroy {
 
   ngOnDestroy(): void {
     this.exporter = null;
+  }
+
+  /** Preset / themed picker on Export → chroma key. */
+  onExportKeyColor(hex: string): void {
+    const n = PipelineStateService.normalizeHex(hex);
+    if (!n) return;
+    this.pipeline.setKeyColor(n);
+    this.exporter?.applySharedKeyColor?.(n, { persist: true, preview: true });
+  }
+
+  onEyedropperError(msg: string): void {
+    this.toast.show(msg || 'Color picker eyedropper failed', 'warning');
   }
 }
