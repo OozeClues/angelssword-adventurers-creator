@@ -382,7 +382,11 @@ EOF
   echo "  ✓ Desktop launcher: Start AS Adventurer.desktop"
 fi
 echo ""
-echo "  Next: double-click Start AS Adventurer.command (macOS) or .desktop/.sh (Linux)"
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  echo "  Next: double-click Start AS Adventurer.command"
+else
+  echo "  Next: run Start AS Adventurer.sh (or the .desktop launcher)"
+fi
 echo ""
 read -r -p "  Press Enter to close..." _
 `;
@@ -422,30 +426,44 @@ function writeUnixLaunchers(dist, binaryName) {
 }
 
 function writeEndUserReadme(dist, target) {
-  const isWin = target.ffmpegPlatform === 'win32';
-  const text = isWin
-    ? `AS Adventurer Creator — no install needed
+  const includes = `Includes: ${target.binary}, bin/${target.ffmpegName}, www/\n`;
+  let text;
+  if (target.ffmpegPlatform === 'win32') {
+    text = `AS Adventurer Creator — no install needed
 
 1. Unzip anywhere
 2. Double-click Start AS Adventurer.bat
 3. Keep the console open while you work
 
-Includes: ${target.binary}, bin/${target.ffmpegName}, www/
-`
-    : `AS Adventurer Creator — no install needed
+${includes}`;
+  } else if (target.ffmpegPlatform === 'darwin') {
+    text = `AS Adventurer Creator — no install needed (macOS)
 
-macOS:
-  1. Unzip
-  2. First time: First Run Setup.command (right-click → Open if blocked)
-  3. Start AS Adventurer.command
+1. Unzip this folder
+2. First time: double-click First Run Setup.command
+   (if macOS blocks it: right-click → Open → Open)
+3. Double-click Start AS Adventurer.command
+4. Your browser opens to http://localhost:3001
+   (open that URL manually if it does not)
 
-Linux:
-  1. Unzip
-  2. First time: First Run Setup.sh
-  3. Start AS Adventurer.desktop or .sh
+Keep the terminal window open while you work.
 
-Includes: ${target.binary}, bin/${target.ffmpegName}, www/
-`;
+${includes}`;
+  } else {
+    // linux
+    text = `AS Adventurer Creator — no install needed (Linux)
+
+1. Unzip this folder
+2. First time: run First Run Setup.sh
+   (chmod +x if needed: chmod +x First\\ Run\\ Setup.sh)
+3. Start with Start AS Adventurer.sh (or the .desktop launcher if present)
+4. Your browser opens to http://localhost:3001
+   (open that URL manually if it does not)
+
+Keep the terminal open while you work.
+
+${includes}`;
+  }
   fs.writeFileSync(path.join(dist, 'README.txt'), text);
 }
 

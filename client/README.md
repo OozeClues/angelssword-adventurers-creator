@@ -1,67 +1,72 @@
-# Client
+# AS Adventurer — Angular client
 
-This project was generated using [Angular CLI](https://github.com/angular/angular-cli) version 22.0.7.
+Primary UI for [AS Adventurer Creator](../README.md): the 4-step VTuber pipeline (Sprite Prep → Generate Video → Video Prep → Export) plus Settings.
 
-## Development server
+Generated with [Angular CLI](https://github.com/angular/angular-cli) **22**. Runtime talks to the local Express app in the repo root (`../server.js`) for AI proxies, SuperGrok OAuth, and ffmpeg export.
 
-To start a local development server, run:
+## Stack
 
-```bash
-ng serve
-```
+| Piece | Role |
+|--------|------|
+| Angular 22 + TypeScript | Tabs, pipeline state, providers |
+| `core/` | Settings, API client, gen-providers, xAI OAuth, toasts, cancel |
+| `features/` | sprite-prep (frame editor, color picker), video-gen, video-prep, exporter, settings |
+| `shared/` | Color picker, swatches, upload zone, mode selector, … |
+| Root `server.js` | Proxies OpenAI / Gemini / xAI; device-code OAuth; static + export |
 
-Once the server is running, open your browser and navigate to `http://localhost:3001/`. The application will automatically reload whenever you modify any of the source files.
+## Dev server
 
-`npm start` runs the full client dev stack (`scripts/dev-client.js`):
-
-1. Ensures **ffmpeg** is available (transparent WebM export)
-2. Starts the **API server** on port **3002** (`SKIP_BROWSER`)
-3. Starts **ng serve** on **3001** (proxies `/api` → 3002)
-
-UI-only (API already running): `npm run start:ui`. Production at the repo root (`npm start`) still serves UI + API together on **3001**.
-
-## Code scaffolding
-
-Angular CLI includes powerful code scaffolding tools. To generate a new component, run:
+From **this** directory:
 
 ```bash
-ng generate component component-name
+npm start
 ```
 
-For a complete list of available schematics (such as `components`, `directives`, or `pipes`), run:
+That runs `../scripts/dev-client.js`, which:
+
+1. Ensures **ffmpeg** is available (transparent WebM export)  
+2. Starts the **API** on port **3002** (`SKIP_BROWSER`)  
+3. Starts **`ng serve`** on **3001** with `/api` → 3002 (`proxy.conf.json`)
+
+Open **http://127.0.0.1:3001/**. The app reloads when you change sources.
+
+UI only (API already running):
 
 ```bash
-ng generate --help
+npm run start:ui
 ```
 
-## Building
+From the **repo root**, production-style (built UI + API on one port):
 
-To build the project run:
+```bash
+npm start    # http://localhost:3001
+```
+
+## Build
 
 ```bash
 ng build
+# or from repo root:
+npm run build
 ```
 
-This will compile your project and store the build artifacts in the `dist/` directory. By default, the production build optimizes your application for performance and speed.
+Artifacts go under `dist/client/` (repo packaging copies browser output into release `www/`).
 
-## Running unit tests
-
-To execute unit tests with the [Vitest](https://vitest.dev/) test runner, use the following command:
+## Tests
 
 ```bash
 ng test
 ```
 
-## Running end-to-end tests
-
-For end-to-end (e2e) testing, run:
+## Scaffolding
 
 ```bash
-ng e2e
+ng generate component features/my-feature/my-feature
+ng generate --help
 ```
 
-Angular CLI does not come with an end-to-end testing framework by default. You can choose one that suits your needs.
+## Related docs
 
-## Additional Resources
-
-For more information on using the Angular CLI, including detailed command references, visit the [Angular CLI Overview and Command Reference](https://angular.dev/tools/cli) page.
+- User-facing pipeline, providers, SuperGrok, packaging: **[../README.md](../README.md)**  
+- Flatpak: **[../flatpak/README.md](../flatpak/README.md)**  
+- Angular CLI reference: [angular.dev/tools/cli](https://angular.dev/tools/cli)

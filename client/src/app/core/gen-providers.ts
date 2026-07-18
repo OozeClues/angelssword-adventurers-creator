@@ -133,7 +133,7 @@ export const IMAGE_PROVIDERS: ImageProviderDef[] = [
     id: 'grok-image',
     label: 'Grok Imagine',
     description:
-      'xAI Grok Imagine (image quality) — text-to-image and reference edits via the Imagine API',
+      'xAI Grok Imagine (image quality) — text-to-image and reference edits via API key or SuperGrok OAuth',
     keyProvider: 'xai',
     modelId: 'grok-imagine-image-quality',
     caps: {
@@ -173,7 +173,7 @@ export const VIDEO_PROVIDERS: VideoProviderDef[] = [
     id: 'grok-video',
     label: 'Grok Imagine Video',
     description:
-      'xAI Grok Imagine Video — image-to-video / text-to-video (1–15s). No dual keyframe start+end.',
+      'xAI Grok Imagine Video — image-to-video / text-to-video (1–15s) via API key or SuperGrok OAuth. No dual keyframe start+end.',
     keyProvider: 'xai',
     modelId: 'grok-imagine-video',
     caps: {
@@ -196,17 +196,36 @@ export const VIDEO_PROVIDERS: VideoProviderDef[] = [
 export const DEFAULT_IMAGE_PROVIDER: ImageProviderId = 'openai-gpt-image';
 export const DEFAULT_VIDEO_PROVIDER: VideoProviderId = 'gemini-omni';
 
+/** Which credential path is used for Grok Imagine (persisted as as_xai_backend). */
+export type XaiBackend = 'api_key' | 'oauth';
+
 export interface ProviderKeys {
   openai: string;
   google: string;
+  /** xAI console API key (may be empty when using SuperGrok OAuth). */
   xai: string;
+  /** SuperGrok OAuth session present. */
+  xaiOAuth: boolean;
+  /** Master toggle: which Grok backend is active. */
+  xaiBackend: XaiBackend;
+}
+
+/** True when the active Grok backend has usable credentials. */
+export function xaiBackendReady(keys: ProviderKeys): boolean {
+  if (keys.xaiBackend === 'oauth') return !!keys.xaiOAuth;
+  return !!keys.xai.trim();
 }
 
 export function providerNeedsKey(def: GenProviderDef, keys: ProviderKeys): boolean {
   if (def.keyProvider === 'openai') return !!keys.openai.trim();
   if (def.keyProvider === 'google') return !!keys.google.trim();
-  if (def.keyProvider === 'xai') return !!keys.xai.trim();
+  if (def.keyProvider === 'xai') return xaiBackendReady(keys);
   return false;
+}
+
+/** Human label for the active Grok credential path. */
+export function xaiBackendLabel(backend: XaiBackend): string {
+  return backend === 'oauth' ? 'SuperGrok OAuth' : 'API Key';
 }
 
 /**

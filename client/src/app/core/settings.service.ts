@@ -1,4 +1,4 @@
-import { Injectable, computed, signal } from '@angular/core';
+import { Injectable, computed, inject, signal } from '@angular/core';
 import { HttpClient } from '@angular/common/http';
 import { firstValueFrom } from 'rxjs';
 import {
@@ -8,16 +8,35 @@ import {
   VIDEO_PROVIDERS,
   type ImageProviderId,
   type VideoProviderId,
+  type XaiBackend,
   availableProviders,
   resolveProvider,
+  xaiBackendLabel,
+  xaiBackendReady,
 } from './gen-providers';
+import { XaiOAuthService } from './xai-oauth.service';
+
+const XAI_BACKEND_KEY = 'as_xai_backend';
+
+function loadXaiBackend(): XaiBackend {
+  const raw = localStorage.getItem(XAI_BACKEND_KEY);
+  return raw === 'oauth' ? 'oauth' : 'api_key';
+}
 
 @Injectable({ providedIn: 'root' })
 export class SettingsService {
+  private readonly oauth = inject(XaiOAuthService);
+
   readonly openaiKey = signal(localStorage.getItem('openai_api_key') ?? '');
   readonly googleKey = signal(localStorage.getItem('google_api_key') ?? '');
   readonly xaiKey = signal(localStorage.getItem('xai_api_key') ?? '');
   readonly soundEnabled = signal(localStorage.getItem('as_sound_enabled') !== 'false');
+
+  /**
+   * Master toggle: which Grok credential path is used for Imagine image/video.
+   * Both can be configured; only the active backend is used for generation.
+   */
+  readonly xaiBackend = signal<XaiBackend>(loadXaiBackend());
 
   /** Preferred providers (may not have a key — UI resolves a fallback). */
   readonly preferredImageProvider = signal<ImageProviderId>(
@@ -27,11 +46,23 @@ export class SettingsService {
     (localStorage.getItem('as_video_provider') as VideoProviderId) || DEFAULT_VIDEO_PROVIDER
   );
 
-  readonly keys = computed(() => ({
-    openai: this.openaiKey(),
-    google: this.googleKey(),
-    xai: this.xaiKey(),
-  }));
+  readonly keys = computed(() => {
+    // Depend on OAuth epoch so provider lists update after login/logout
+    this.oauth.authEpoch();
+    return {
+      openai: this.openaiKey(),
+      google: this.googleKey(),
+      xai: this.xaiKey(),
+      xaiOAuth: this.oauth.isLoggedIn(),
+      xaiBackend: this.xaiBackend(),
+    };
+  });
+
+  /** Whether the currently selected Grok backend has credentials. */
+  readonly xaiReady = computed(() => xaiBackendReady(this.keys()));
+
+  /** Short label for UI: "SuperGrok OAuth" | "API Key" */
+  readonly xaiBackendLabel = computed(() => xaiBackendLabel(this.xaiBackend()));
 
   readonly availableImageProviders = computed(() =>
     availableProviders(IMAGE_PROVIDERS, this.keys())
@@ -49,6 +80,12 @@ export class SettingsService {
   );
 
   constructor(private readonly http: HttpClient) {}
+
+  setXaiBackend(backend: XaiBackend): void {
+    const next = backend === 'oauth' ? 'oauth' : 'api_key';
+    this.xaiBackend.set(next);
+    localStorage.setItem(XAI_BACKEND_KEY, next);
+  }
 
   saveOpenAIKey(key: string): void {
     const trimmed = key.trim();
@@ -90,6 +127,26 @@ export class SettingsService {
     localStorage.setItem('as_sound_enabled', String(enabled));
   }
 
+  /**
+   * Bearer token for the *active* Grok backend (API key or SuperGrok OAuth).
+   * Returns null if that backend is not configured.
+   */
+  async getXaiBearerToken(): Promise<string | null> {
+    if (this.xaiBackend() === 'oauth') {
+      return this.oauth.getAccessToken();
+    }
+    const key = this.xaiKey().trim();
+    return key || null;
+  }
+
+  /** Actionable error when Grok is selected but the active backend has no credentials. */
+  xaiMissingCredentialMessage(): string {
+    if (this.xaiBackend() === 'oauth') {
+      return 'Not logged in with SuperGrok. Go to Settings → Grok Imagine → Login with SuperGrok.';
+    }
+    return 'No xAI API key. Go to Settings → Grok Imagine and add a console.x.ai API key (or switch to SuperGrok OAuth).';
+  }
+
   async testOpenAI(key: string): Promise<void> {
     await firstValueFrom(
       this.http.post(
@@ -117,11 +174,9 @@ export class SettingsService {
   }
 
   /**
-   * Validates an xAI key via the local proxy (tiny chat completion, with
-   * models-list fallback). Surfaces the real xAI error body when present.
+   * Validates an xAI API key (or any Bearer) via the local proxy.
    */
   async testXai(key: string): Promise<void> {
-    // Normalize common paste mistakes before sending
     const cleaned = key
       .trim()
       .replace(/^Bearer\s+/i, '')
@@ -142,6 +197,13 @@ export class SettingsService {
     } catch (err) {
       throw new Error(this.formatHttpApiError(err, 'xAI connection failed'));
     }
+  }
+
+  /** Test the currently active Grok backend (API key or OAuth token). */
+  async testActiveXaiBackend(): Promise<void> {
+    const token = await this.getXaiBearerToken();
+    if (!token) throw new Error(this.xaiMissingCredentialMessage());
+    await this.testXai(token);
   }
 
   /**

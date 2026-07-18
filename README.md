@@ -2,190 +2,277 @@
 
 **VTuber Creation Pipeline by Angel's Sword Studios**
 
-*Design · Generate · Prepare · Export*
+_Design · Generate · Prepare · Export_
+
+Local web app that turns a static character sprite into a transparent looping animation for streaming (OBS, PNGtuber apps, [AS Reactive Overlay](https://www.angelssword.com), etc.).
+
+Upstream / original project: [AngelsSwordStudios/angelssword-adventurers-creator](https://github.com/AngelsSwordStudios/angelssword-adventurers-creator)
 
 ---
 
 ## What Is This?
 
-AS Adventurer Creator is a standalone desktop tool that lets you create animated VTuber / PNGtuber assets from scratch. It walks you through a simple 4-step pipeline — from a static sprite all the way to a transparent, looping animated model ready for streaming.
+AS Adventurer walks you through a **4-step pipeline**:
 
-No installation required. Just run `ASAdventurer.exe` and open your browser.
+| Step | Tab                | What it does                                                            |
+| ---- | ------------------ | ----------------------------------------------------------------------- |
+| ①    | **Sprite Prep**    | Upload or **AI-generate** a chroma-keyed sprite; frame-edit on 1280×720 |
+| ②    | **Generate Video** | Animate the sprite with online video models _(optional)_                |
+| ③    | **Video Prep**     | Loop builder, trim, concat, crossfade _(offline)_                       |
+| ④    | **Model Exporter** | Chroma key out → transparent WebM / GIF _(offline)_                     |
+
+**AI providers (configure in Settings; pick per step when keys/session are ready):**
+
+| Feature             | Providers                                                                                 |
+| ------------------- | ----------------------------------------------------------------------------------------- |
+| Sprite generation   | **OpenAI** GPT Image 2 · **Gemini** Image · **Grok Imagine** (API key or SuperGrok OAuth) |
+| Video generation    | **Gemini** Omni Flash · **Grok Imagine Video** (API key or SuperGrok OAuth)               |
+| Video Prep + Export | Fully offline — no API keys                                                               |
+
+> **No AI keys required** if you bring your own sprites and videos. Steps ③–④ work fully offline.
 
 ---
 
 ## Quick Start
 
-1. **Double-click** `ASAdventurer.exe` (or use `Start AS Adventurer.bat`)
-2. Your browser will open to `http://localhost:3001`
-3. Follow the 4-step pipeline below
+### Packaged build (end users)
+
+1. Unzip the release for your OS (Windows / macOS / Linux), or install the Flatpak on Linux.
+2. Run the launcher:
+   - **Windows:** `ASAdventurer.exe` or `Start AS Adventurer.bat`
+   - **macOS:** first-time `First Run Setup.command`, then `Start AS Adventurer.command`
+   - **Linux:** first-time `First Run Setup.sh`, then `Start AS Adventurer.sh` (or Flatpak: `flatpak run studio.angelssword.ASAdventurer`)
+3. Browser opens to **http://localhost:3001** (open that URL manually if it doesn’t).
+
+### From source (developers)
+
+```bash
+git clone https://github.com/OozeClues/angelssword-adventurers-creator.git
+cd angelssword-adventurers-creator
+npm install          # also installs client/ deps
+npm start            # API + built UI on http://localhost:3001
+```
+
+**Angular UI development** (hot reload):
+
+```bash
+npm run dev:client   # API on 3002, ng serve on 3001 (proxies /api)
+```
+
+See [client/README.md](client/README.md) for Angular-only details.
+
+**Optional port:**
+
+```bash
+PORT=3080 npm start
+```
 
 ---
 
 ## The Pipeline
 
-### ① Sprite Prep  🎨
+### ① Sprite Prep 🎨
 
-**What it does:** Create or prepare a character sprite image on a solid chroma key background.
+Prepare a character on a solid chroma-key background for the 1280×720 pipeline canvas.
 
-**Two modes:**
-- **Upload Mode** — Drag in an existing character sprite (PNG with transparency). The tool places it on a colored background automatically.
-- **Generate Mode** — Describe your character in a text prompt and generate a sprite using AI (requires an OpenAI API key).
+**Modes**
 
-**Key features:**
-- Pick your chroma key color (magenta, green, blue, or custom)
-- Adjust canvas size and sprite positioning
-- Download the result as a PNG ready for animation
+- **Manual Upload** — Drop PNG/JPEG/WebP. Auto key-color detection + override. Info sidebar for best source-image practices.
+- **AI Generate** — Name, description, optional action, **race mode** (Normal / Kanolith / Zoalith), character + style references, provider & format options, batch count.
 
-**Output:** A character sprite on a solid-color background (e.g., magenta), ready for Step 2.
+**Frame editor** (both modes, after you have a sprite or selected gen result)
 
----
+- 1280×720 canvas with **chroma fill** in empty areas
+- **Drag** to move · **corner handles** to rotate · **zoom** slider (100% = natural size)
+- Spill outside the frame is **cropped** on export/handoff
+- **Key color:** presets, HSV/RGB/hex picker, sample from frame, optional system eyedropper
+- Custom key color is stored in your browser's `localStorage` and **persists** through Video Gen → Prep → Export
 
-### ② Generate Video  🎬
+**AI providers for sprites:** GPT Image 2 (default recommendation), Gemini Image, Grok Imagine.
 
-**What it does:** Turn your static sprite into an animated video using Google's Gemini AI.
-
-> **💡 This step is optional.** If you already have an animated video from another tool (Veo, RunwayML, Kling, etc.), skip directly to Step 3.
-
-**How to use:**
-1. Your sprite from Step 1 is automatically carried over (or upload your own reference images)
-2. Write a motion prompt describing the animation you want (e.g., "character gently breathing and blinking, idle animation")
-3. Set the video length (3-10 seconds) and number of simultaneous generations
-4. Click Generate — Gemini creates a short animated video
-
-**Requirements:**
-- A Google Gemini API key (set up in the Settings tab)
-- Cost: approximately $0.10 per second of video
-
-**Output:** A short animated video clip (MP4) of your character moving on the chroma key background.
+**Handoff:** Download framed PNG, or **Send to Generate Video**. Multi-result AI runs use **single select** before continuing.
 
 ---
 
-### ③ Video Prep  🔄
+### ② Generate Video 🎬 _(optional)_
 
-**What it does:** Prepare your generated video for seamless looping and export.
+Turn a still reference into a short animated clip using online models.
 
-**Key features:**
-- **Frame Trimming** — Set in/out points to cut unwanted frames from the start or end
-- **Loop Building** — Create seamless loops using:
-  - **Ping-Pong** — Plays forward then backward for a natural bounce
-  - **Reverse** — Plays the video in reverse
-  - **Crossfade** — Blend the start and end frames for smooth transitions
-- **Concatenation** — Combine multiple video clips together
-- **Onion Skinning** — Overlay frame 0 at 50% opacity to help align loop points
-- **Preview** — Scrub through frames and preview the final loop before exporting
-
-**Output:** A prepared, looping video clip ready for chroma key removal in Step 4.
+- Sprite from Step 1 is carried over, or upload your own reference(s)
+- **Providers:** Gemini Omni Flash (recommended; image-to-video + start/end **keyframe** mode) or Grok Imagine Video (i2v / t2v, 1–15s; no dual keyframe)
+- Aspect / resolution / duration depend on the selected provider
+- Single-select among batch results, then **Add to Video Preparation**
+- Skip entirely and drop your own MP4/WebM into Video Prep if you prefer external tools (Veo, Runway, Kling, ComfyUI, etc.)
 
 ---
 
-### ④ Model Exporter  📦
+### ③ Video Prep 🔄
 
-**What it does:** Remove the chroma key background and export as a transparent animated file.
+Offline loop tooling:
 
-**Export formats:**
-| Mode | Format | Max Frames | Max Resolution |
-|------|--------|------------|----------------|
-| ⚔️ Adventurer | WebM (VP9 alpha) | Unlimited | Unlimited |
-| 🟢 F. Normal | GIF | 120 frames | 1000×1000 |
-| 💎 F. Premium | GIF | 600 frames | 4000×4000 |
-
-**Chroma Key Controls:**
-- **Key Color** — Pick or eyedrop the background color to remove
-- **Similarity** — How close a pixel must be to the key color to be removed (default: 40%)
-- **Smoothness** — How gradually edges transition from opaque to transparent (default: 8%)
-- **Spill Suppression** — Remove color contamination from the key bleeding onto the character (default: 10%)
-
-**Additional features:**
-- Frame scrubber with play/pause for previewing
-- Crop tool to trim the output
-- Real-time preview with checkerboard transparency
-
-**Output:** A transparent WebM or GIF file — ready to use in streaming overlays like AS Reactive Overlay, OBS, or any PNGtuber app.
+- Frame scrubber, onion skin, loop point
+- **Ping-Pong** / **Reverse** / no loop
+- Optional second video + **crossfade**
+- Handoff to Model Exporter
 
 ---
 
-## Settings  ⚙️
+### ④ Model Exporter 📦
 
-Access the Settings tab to configure:
+Chroma-key removal and transparent export:
 
-- **OpenAI API Key** — Required for AI sprite generation (Step 1, Generate mode)
-- **Google Gemini API Key** — Required for AI video generation (Step 2)
+| Mode          | Format           | Limits                        |
+| ------------- | ---------------- | ----------------------------- |
+| ⚔️ Adventurer | WebM (VP9 alpha) | Unlimited frames / resolution |
+| 🟢 F. Normal  | GIF              | 120 frames, 1000×1000         |
+| 💎 F. Premium | GIF              | 600 frames, 4000×4000         |
 
-API keys are stored locally in your browser's storage. They are never sent anywhere except directly to the respective API services.
+Controls: key color (shared pipeline color + eyedropper), similarity, smoothness, spill, scale, crop, smoke cleanup, filename presets, live preview.
 
-> **💡 No API keys needed** if you bring your own sprite images and animated videos. Steps 3-4 work entirely offline.
+---
+
+## Settings ⚙️
+
+| Setting                   | Purpose                                                                                                                                                              |
+| ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **OpenAI API key**        | GPT Image 2 sprites                                                                                                                                                  |
+| **Google Gemini API key** | Gemini image + Omni Flash video                                                                                                                                      |
+| **Grok Imagine**          | Image + video via **API key** _or_ **SuperGrok / X Premium+ OAuth** — master toggle (`as_xai_backend` in localStorage) chooses which credential every Grok call uses |
+| **Notifications**         | Sound on generation complete                                                                                                                                         |
+
+Credentials live only in browser **localStorage** and are sent only to official OpenAI / Google / xAI (`auth.x.ai` / `api.x.ai`) endpoints through the **local** Node proxy.
+
+---
+
+## Changes from the original
+
+This repository is based on [AngelsSwordStudios/angelssword-adventurers-creator](https://github.com/AngelsSwordStudios/angelssword-adventurers-creator). Relative to that upstream vanilla app, major differences include:
+
+### Architecture
+
+- **Angular** SPA under `client/` (primary UI) instead of a single vanilla `public/` app
+- Express **`server.js`** still proxies AI + hosts static/export; production builds embed the Angular `www/` bundle
+- **Legacy** vanilla sources kept under `public/` and `legacy-vanilla/` for reference (not the main UI path)
+
+### AI / providers
+
+- **Multi-provider image gen:** OpenAI GPT Image 2, Gemini Image, Grok Imagine (not OpenAI-only)
+- **Multi-provider video gen:** Gemini Omni Flash + Grok Imagine Video (not Gemini-only)
+- Per-provider **aspect / size / resolution / duration** caps in the UI
+- **Grok dual backend:** xAI console API key **or** SuperGrok device-code OAuth, with a discrete **master toggle** and clear active-backend status
+
+### Sprite Prep UX
+
+- Interactive **frame editor**: move, rotate, zoom, chroma fill, clipped export
+- **Themed color picker** (HSV plane + RGB/hex; same UI on every OS) + frame eyedropper + optional system eyedropper
+- Pipeline-wide **persisted key color** (`as_key_color`)
+- Info sidebars (manual best practices / AI generate guidance) instead of always-on preview-only sidebars
+- Single-select among AI results before handoff
+
+### Packaging & platforms
+
+- Multi-target packaging via `build-exe.js`: **Windows** (x64/arm64), **macOS** (x64/arm64), **Linux** (x64/arm64), **Flatpak**
+- Bundled **ffmpeg** for transparent WebM export
+
+### Other
+
+- Dev split: API on **3002**, Angular on **3001** with `/api` proxy (`npm run dev:client`)
+- Privacy copy covers OAuth tokens as well as API keys
+
+For packaging internals see [flatpak/README.md](flatpak/README.md). Historical design notes: [HANDOFF.md](HANDOFF.md) (may lag the Angular rewrite).
 
 ---
 
 ## Using with AS Reactive Overlay
 
-The assets you export from AS Adventurer are designed to work seamlessly with **AS Reactive Overlay** (our streaming overlay tool):
+1. Export transparent WebM with naming presets, e.g.:
+   - `character_idle.webm` · `character_speaking.webm` · `character_intro.webm` · `character_outro.webm`
+2. Place files in Reactive Overlay’s `public/assets/` (or your OBS/PNGtuber layout)
+3. Load as animated VTuber states
 
-1. Export your character animations as transparent WebM files using the naming presets:
-   - `character_idle.webm` — Default idle animation
-   - `character_speaking.webm` — Talking animation
-   - `character_intro.webm` — Entrance animation
-   - `character_outro.webm` — Exit animation
-2. Place the exported files into Reactive Overlay's `public/assets/` folder
-3. Reactive Overlay will automatically load and display them as your VTuber's animated states
-
-The exported WebM files also work with any OBS browser source, PNGtuber app, or other streaming tools that support transparent video.
+WebM with alpha also works in OBS browser sources and similar tools.
 
 ---
 
 ## System Requirements
 
-- **OS:** Windows 10/11 (64-bit)
-- **Browser:** Chrome, Edge, or Firefox (opens automatically)
-- **Internet:** Required only for AI generation steps (Steps 1-2). Steps 3-4 work fully offline.
-- **Disk Space:** ~40 MB for the application
+|              |                                                                  |
+| ------------ | ---------------------------------------------------------------- |
+| **OS**       | Windows 10/11, macOS, or Linux (x64 or arm64 depending on build) |
+| **Browser**  | Chrome, Edge, or Firefox                                         |
+| **Internet** | Only for AI steps (① generate / ② video). ③–④ offline            |
+| **Node**     | 18+ if running from source                                       |
+| **Disk**     | ~40 MB+ for the app;                                             |
 
 ---
 
-## File Structure
+## Project structure (source)
 
 ```
-ASAdventurer/
-├── ASAdventurer.exe          ← Main application (double-click to run)
-├── Start AS Adventurer.bat   ← Launcher with console output
-├── README.md                 ← This file
-├── icon.ico                  ← Application icon
-└── public/                   ← UI files (do not modify)
-    ├── index.html
-    ├── style.css
-    ├── sprite-prep.js
-    ├── video-prep.js
-    ├── model-exporter.js
-    └── assets/
+angelssword-adventurers-creator/
+├── server.js                 # Express: static UI, OpenAI/Gemini/xAI proxies, OAuth, export
+├── package.json              # Root scripts: start, build, multi-platform packaging
+├── client/                   # Angular 22 app (primary UI)
+│   ├── src/app/
+│   │   ├── core/             # settings, API, providers, OAuth, pipeline state
+│   │   ├── features/         # sprite-prep, video-gen, video-prep, exporter, settings
+│   │   └── shared/           # color picker, swatches, upload zone, …
+│   └── README.md
+├── scripts/                  # ensure-ffmpeg, dev-client, build helpers
+├── flatpak/                  # Flatpak packaging
+├── public/ · legacy-vanilla/ # Older vanilla UI snapshots
+├── bin/                      # Bundled ffmpeg (after ensure-ffmpeg / package)
+└── dist/                     # Release outputs
 ```
 
 ---
 
-## Tips & Tricks
+## Tips
 
-- **Best chroma key results:** Use **magenta** (`#FF00FF`) as your key color — it rarely appears in character art.
-- **Smooth loops:** Use Ping-Pong mode in Video Prep for the easiest seamless loops.
-- **AI prompts:** Be specific about the motion you want. "Gentle idle breathing animation, slight hair movement" works better than "make it move."
-- **Spill suppression:** If you see a colored fringe around your character after keying, increase the Spill Suppression slider.
-- **WebM for streaming:** The Adventurer (WebM) format supports true alpha transparency and is ideal for OBS browser sources.
+- **Magenta** (`#FF00FF`) is often safest for character art chroma key.
+- **Ping-Pong** loops are the easiest seamless idles.
+- Default video prompt is tuned for **Gemini**; replace `(Character description)` and `(Animation Type)` with short, specific phrases.
+- **GPT Image 2** is preferred for sprites especially when using race modes (coherent placement + prompts).
+- Grok login issues: Settings → Logout / Refresh Token / re-login with SuperGrok.
 
 ---
 
 ## Troubleshooting
 
-| Problem | Solution |
-|---------|----------|
-| Browser doesn't open | Navigate manually to `http://localhost:3001` |
-| Port 3001 in use | Close other instances or set `PORT` environment variable |
-| AI generation fails | Check your API key in Settings and ensure you have credits |
-| Video won't load | Try converting to MP4 (H.264) first — some codecs aren't supported |
-| Export looks wrong | Adjust Similarity/Smoothness sliders — start with defaults |
+| Problem               | Solution                                                                   |
+| --------------------- | -------------------------------------------------------------------------- |
+| Browser doesn’t open  | Open http://localhost:3001 manually                                        |
+| Port 3001 in use      | Set `PORT` or close other instances                                        |
+| `npm start` fails     | Node 18+; run `npm install` (and under `client/`)                          |
+| OpenAI / Gemini fails | Settings → key + Test; check credits                                       |
+| Grok not available    | Settings → API key **or** SuperGrok login; check **active backend** toggle |
+| Grok token expired    | Refresh Token or re-login                                                  |
+| Video won’t load      | Prefer MP4 H.264                                                           |
+| Export fringe         | Raise Spill Suppression / tweak Similarity                                 |
+
+---
+
+## Development notes
+
+- All AI traffic goes through the **local proxy** in `server.js` (CORS + secrets stay off third-party frontends).
+- No cloud backend of yours is required — everything runs on the user’s machine.
+- SuperGrok uses a public device-code OAuth client (CLI-style); tokens stay in the browser.
+- Production UI is the Angular build copied into the packaged `www/` tree.
+
+```bash
+npm run build              # client production build
+npm run build:windows      # example platform package
+npm run build:all          # multi-platform (see package.json)
+```
 
 ---
 
 ## Credits
 
-**AS Adventurer Creator** by Angel's Sword Studios
+**AS Adventurer Creator** by [Angel's Sword Studios](https://www.angelssword.com)
+
+Upstream pipeline: [AngelsSwordStudios/angelssword-adventurers-creator](https://github.com/AngelsSwordStudios/angelssword-adventurers-creator)
+
+**AS Adventurer Creator – Angular Edition** by [Ooze Clues](https://x.com/oozeclue)
 
 Built with ❤️ for the VTuber community.

@@ -36,8 +36,6 @@ import {
   rgbToLab,
 } from '../../shared/utils/key-colors';
 import {
-  base64ToBlob,
-  blobToBase64,
   colorName,
   downloadBlob,
   downloadDataUrl,
@@ -45,6 +43,7 @@ import {
   loadImage,
   scrollAppResultsIntoView,
 } from '../../shared/utils/media';
+import { SpriteFrameEditorComponent } from './sprite-frame-editor.component';
 
 @Component({
   selector: 'app-sprite-prep',
@@ -54,13 +53,14 @@ import {
     UploadZoneComponent,
     ModeSelectorComponent,
     GenCountComponent,
+    SpriteFrameEditorComponent,
   ],
   templateUrl: './sprite-prep.component.html',
 })
 export class SpritePrepComponent implements AfterViewInit, OnDestroy {
   @ViewChild('genResultsPanel') genResultsPanel?: ElementRef<HTMLElement>;
-  @ViewChild('spCanvas') spCanvasRef?: ElementRef<HTMLCanvasElement>;
-  @ViewChild('sgCanvas') sgCanvasRef?: ElementRef<HTMLCanvasElement>;
+  @ViewChild('manualEditor') manualEditor?: SpriteFrameEditorComponent;
+  @ViewChild('genEditor') genEditor?: SpriteFrameEditorComponent;
   @ViewChild('advKeyCanvas') advKeyCanvasRef?: ElementRef<HTMLCanvasElement>;
 
   private readonly pipeline = inject(PipelineStateService);
@@ -77,7 +77,6 @@ export class SpritePrepComponent implements AfterViewInit, OnDestroy {
     { value: 'generate', label: '✨ AI Generate', title: 'Generate a sprite using AI' },
   ];
 
-  /** Provider buttons — only services with an API key configured. */
   readonly imageProviderOptions = computed(() =>
     this.settings.availableImageProviders().map((p) => ({
       value: p.id,
@@ -89,10 +88,13 @@ export class SpritePrepComponent implements AfterViewInit, OnDestroy {
   readonly imageProviderNote = computed(() => {
     const sel = this.settings.imageProviderSelection();
     if (!sel.provider) {
-      return 'No image API keys set. Add an OpenAI, Gemini, or xAI (Grok) key in Settings.';
+      return 'No image providers ready. Add an OpenAI, Gemini, or xAI key — or log in with SuperGrok — in Settings.';
     }
     if (sel.fellBack) {
       return `Using ${sel.provider.label} (fallback — preferred provider has no API key).`;
+    }
+    if (sel.provider.keyProvider === 'xai') {
+      return `${sel.provider.label} via ${this.settings.xaiBackendLabel()} · configure in Settings`;
     }
     if (sel.provider.recommended) {
       return `${sel.provider.label} · recommended for sprites`;
@@ -104,11 +106,9 @@ export class SpritePrepComponent implements AfterViewInit, OnDestroy {
     () => this.settings.imageProviderSelection().provider?.id ?? ''
   );
 
-  /** Catalog default for empty-state recommendation (GPT Image 2). */
   readonly recommendedImageProviderLabel =
     IMAGE_PROVIDERS.find((p) => p.recommended)?.label ?? 'GPT Image 2';
 
-  /** Current image provider caps (aspect / size / resolution options). */
   readonly imageCaps = computed(
     () => getImageProvider(this.settings.imageProviderSelection().provider?.id)?.caps ?? null
   );
@@ -117,15 +117,9 @@ export class SpritePrepComponent implements AfterViewInit, OnDestroy {
   readonly imageSizeOptions = computed(() => this.imageCaps()?.sizes ?? []);
   readonly imageResolutionOptions = computed(() => this.imageCaps()?.resolutions ?? []);
 
-  readonly imageAspect = signal(
-    localStorage.getItem('as_image_aspect') || '16:9'
-  );
-  readonly imageSize = signal(
-    localStorage.getItem('as_image_size') || '1536x1024'
-  );
-  readonly imageResolution = signal(
-    localStorage.getItem('as_image_resolution') || '1K'
-  );
+  readonly imageAspect = signal(localStorage.getItem('as_image_aspect') || '16:9');
+  readonly imageSize = signal(localStorage.getItem('as_image_size') || '1536x1024');
+  readonly imageResolution = signal(localStorage.getItem('as_image_resolution') || '1K');
 
   readonly raceMode = signal('normal');
   readonly raceOptions = [
@@ -141,10 +135,11 @@ export class SpritePrepComponent implements AfterViewInit, OnDestroy {
 
   readonly keyColor = signal(this.pipeline.keyColor());
   readonly swatchBadges = signal<Record<string, SwatchBadge>>({});
-  readonly offset = signal(parseInt(localStorage.getItem('sp-offset') || '0', 10) || 0);
-  readonly zoom = signal(parseInt(localStorage.getItem('sp-zoom') || '100', 10) || 100);
 
-  readonly hasSprite = signal(false);
+  /** Manual upload source for the frame editor (data URL). */
+  readonly manualImageSrc = signal<string | null>(null);
+  private spriteFileName = '';
+
   readonly genCount = signal(1);
   readonly generating = signal(false);
   readonly genStatus = signal<{ type: string; text: string } | null>(null);
@@ -164,11 +159,8 @@ export class SpritePrepComponent implements AfterViewInit, OnDestroy {
   >([]);
   readonly advKeyCanAnalyze = signal(false);
 
-  private spriteImage: HTMLImageElement | null = null;
-  private spriteFileName = '';
   private genCancelled = false;
   private unregCancel: (() => void) | null = null;
-  private renderTimer: ReturnType<typeof setTimeout> | null = null;
 
   private advKeyRect: { x: number; y: number; w: number; h: number } | null = null;
   private advKeyImg: HTMLImageElement | null = null;
@@ -178,20 +170,11 @@ export class SpritePrepComponent implements AfterViewInit, OnDestroy {
   readonly advSelectionStyle = signal<Record<string, string>>({ display: 'none' });
 
   constructor() {
-    // Keep local swatch UI in sync when another tab updates the shared key color.
     effect(() => {
       const shared = this.pipeline.keyColor();
       if (shared && shared !== this.keyColor()) {
         this.keyColor.set(shared);
       }
-    });
-
-    effect(() => {
-      // re-render when key inputs change
-      this.keyColor();
-      this.offset();
-      this.zoom();
-      if (this.hasSprite()) this.scheduleRender();
     });
   }
 
@@ -206,7 +189,6 @@ export class SpritePrepComponent implements AfterViewInit, OnDestroy {
 
   ngOnDestroy(): void {
     this.unregCancel?.();
-    if (this.renderTimer) clearTimeout(this.renderTimer);
   }
 
   onModeChange(m: string): void {
@@ -226,49 +208,30 @@ export class SpritePrepComponent implements AfterViewInit, OnDestroy {
   }
 
   onKeyColorChange(color: string): void {
-    this.keyColor.set(color);
+    // Pipeline normalizes + writes localStorage `as_key_color` for the whole workflow
     this.pipeline.setKeyColor(color);
-  }
-
-  onOffsetInput(e: Event): void {
-    const v = parseInt((e.target as HTMLInputElement).value, 10);
-    this.offset.set(v);
-    localStorage.setItem('sp-offset', String(v));
-  }
-
-  onZoomInput(e: Event): void {
-    const v = parseInt((e.target as HTMLInputElement).value, 10);
-    this.zoom.set(v);
-    localStorage.setItem('sp-zoom', String(v));
+    const normalized = this.pipeline.keyColor();
+    this.keyColor.set(normalized);
   }
 
   async onSpriteFiles(files: FileList): Promise<void> {
     const file = files[0];
     if (!file) return;
-    const url = URL.createObjectURL(file);
     try {
-      const img = await loadImage(url);
-      this.spriteImage = img;
+      const dataUrl = await fileToDataUrl(file);
+      const img = await loadImage(dataUrl);
       this.spriteFileName = file.name.replace(/\.\w+$/i, '');
-      this.hasSprite.set(true);
+      this.manualImageSrc.set(dataUrl);
       this.applyAutoKeyColor(img);
-      this.scheduleRender();
       this.toast.show(`Sprite loaded: ${img.naturalWidth}×${img.naturalHeight}`, 'success');
     } catch {
       this.toast.show('Failed to load image', 'error');
-      URL.revokeObjectURL(url);
     }
   }
 
   clearSprite(): void {
-    this.spriteImage = null;
+    this.manualImageSrc.set(null);
     this.spriteFileName = '';
-    this.hasSprite.set(false);
-    const canvas = this.spCanvasRef?.nativeElement;
-    if (canvas) {
-      const ctx = canvas.getContext('2d');
-      ctx?.clearRect(0, 0, canvas.width, canvas.height);
-    }
     this.toast.show('Sprite cleared', 'info');
   }
 
@@ -297,76 +260,47 @@ export class SpritePrepComponent implements AfterViewInit, OnDestroy {
     this.pipeline.setKeyColor(selected);
   }
 
-  private scheduleRender(): void {
-    if (this.renderTimer) clearTimeout(this.renderTimer);
-    this.renderTimer = setTimeout(() => this.renderCanvas(), 50);
-  }
-
-  private renderCanvas(): void {
-    if (!this.spriteImage) return;
-    const canvas = this.spCanvasRef?.nativeElement;
-    if (!canvas) return;
-    const ctx = canvas.getContext('2d')!;
-    const CW = 1280;
-    const CH = 720;
-    const selectedKeyColor = this.keyColor();
-    const offset = this.offset();
-    const zoom = this.zoom();
-
-    ctx.fillStyle = selectedKeyColor;
-    ctx.fillRect(0, 0, CW, CH);
-
-    const img = this.spriteImage;
-    const sw = img.naturalWidth;
-    const sh = img.naturalHeight;
-
-    const tc = document.createElement('canvas');
-    tc.width = sw;
-    tc.height = sh;
-    const tctx = tc.getContext('2d', { willReadFrequently: true })!;
-    tctx.drawImage(img, 0, 0);
-    const data = tctx.getImageData(0, 0, sw, sh).data;
-
-    let bottomRow = sh - 1;
-    outer: for (let y = sh - 1; y >= 0; y--) {
-      for (let x = 0; x < sw; x++) {
-        if (data[(y * sw + x) * 4 + 3] > 30) {
-          bottomRow = y;
-          break outer;
-        }
-      }
+  async downloadPNG(): Promise<void> {
+    const editor = this.manualEditor;
+    if (!editor) {
+      this.toast.show('Load a sprite first', 'warning');
+      return;
     }
-
-    const spriteY = CH - bottomRow - 1 + offset;
-    const spriteX = Math.round((CW - sw) / 2);
-    const scale = zoom / 100;
-    const drawW = Math.round(sw * scale);
-    const drawH = Math.round(sh * scale);
-    const zoomX = spriteX + Math.round((sw - drawW) / 2);
-    const zoomY = spriteY + (sh - drawH);
-    ctx.drawImage(img, zoomX, zoomY, drawW, drawH);
-  }
-
-  downloadPNG(): void {
-    const canvas = this.spCanvasRef?.nativeElement;
-    if (!canvas) return;
-    canvas.toBlob((blob) => {
-      if (!blob) return;
+    try {
+      const frame = await editor.exportFrame();
+      if (!frame) {
+        this.toast.show('Could not export frame', 'error');
+        return;
+      }
       const name = this.pipeline.characterName() || this.spriteFileName || 'sprite';
-      downloadBlob(blob, `${name}_1280x720.png`);
-    }, 'image/png');
+      downloadBlob(frame.blob, `${name}_1280x720.png`);
+    } catch (err) {
+      this.toast.show('Download failed: ' + (err as Error).message, 'error');
+    }
   }
 
-  handoffToVideoGen(): void {
-    const canvas = this.spCanvasRef?.nativeElement;
-    if (!canvas) return;
-    canvas.toBlob(async (blob) => {
-      if (!blob) return;
-      const b64 = await blobToBase64(blob);
-      this.pipeline.handoffSprite({ blob, base64: b64, keyColor: this.keyColor() });
+  async handoffToVideoGen(): Promise<void> {
+    const editor = this.manualEditor;
+    if (!editor) {
+      this.toast.show('Load a sprite first', 'warning');
+      return;
+    }
+    try {
+      const frame = await editor.exportFrame();
+      if (!frame) {
+        this.toast.show('Could not prepare sprite for handoff', 'error');
+        return;
+      }
+      this.pipeline.handoffSprite({
+        blob: frame.blob,
+        base64: frame.base64,
+        keyColor: this.keyColor(),
+      });
       this.toast.show('Sprite sent to Generate Video', 'success');
       void this.router.navigate(['/video-gen']);
-    }, 'image/png');
+    } catch (err) {
+      this.toast.show('Handoff failed: ' + (err as Error).message, 'error');
+    }
   }
 
   async onCharRef(files: FileList): Promise<void> {
@@ -401,7 +335,11 @@ export class SpritePrepComponent implements AfterViewInit, OnDestroy {
     const ctx = canvas.getContext('2d')!;
     ctx.drawImage(img, 0, 0);
     const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-    const scores = scoreKeyColorsFromReferenceImageData(imageData.data, canvas.width, canvas.height);
+    const scores = scoreKeyColorsFromReferenceImageData(
+      imageData.data,
+      canvas.width,
+      canvas.height
+    );
     if (scores) this.applyScores(scores);
   }
 
@@ -461,7 +399,6 @@ export class SpritePrepComponent implements AfterViewInit, OnDestroy {
     this.syncImageFormatToProvider(value as ImageProviderId);
   }
 
-  /** Keep aspect/size/resolution valid when switching providers. */
   private syncImageFormatToProvider(id: ImageProviderId): void {
     const caps = getImageProvider(id)?.caps;
     if (!caps) return;
@@ -516,11 +453,13 @@ export class SpritePrepComponent implements AfterViewInit, OnDestroy {
     }
     const sel = this.settings.imageProviderSelection();
     if (!sel.provider) {
-      this.toast.show('Add an OpenAI, Gemini, or xAI (Grok) API key in Settings first', 'warning');
+      this.toast.show(
+        'Add an OpenAI, Gemini, or xAI key — or log in with SuperGrok — in Settings first',
+        'warning'
+      );
       return;
     }
 
-    // Ensure format values match current provider caps
     this.syncImageFormatToProvider(sel.provider.id);
 
     this.generating.set(true);
@@ -564,10 +503,8 @@ export class SpritePrepComponent implements AfterViewInit, OnDestroy {
       this.genResults.set(ok);
       if (ok.length > 0) {
         this.selectedResult.set(ok[0]);
-        this.updateGenPreview(ok[0]);
         this.sound.play();
         this.genStatus.set({ type: 'success', text: `✅ Generated ${ok.length} sprite(s)!` });
-        // Results render below the fold — bring the panel into view for action.
         setTimeout(() => scrollAppResultsIntoView(this.genResultsPanel?.nativeElement), 50);
       } else if (!this.genCancelled) {
         const errors = results
@@ -580,9 +517,7 @@ export class SpritePrepComponent implements AfterViewInit, OnDestroy {
           })
           .filter((m) => !!m && m !== 'undefined' && m !== 'null');
         const unique = [...new Set(errors)];
-        const detail =
-          unique[0] ||
-          'All generations failed. Check your API key and try again.';
+        const detail = unique[0] || 'All generations failed. Check your API key and try again.';
         console.error('[SpritePrep] generation failures:', unique);
         this.genStatus.set({
           type: 'error',
@@ -603,58 +538,65 @@ export class SpritePrepComponent implements AfterViewInit, OnDestroy {
 
   selectResult(dataUrl: string): void {
     this.selectedResult.set(dataUrl);
-    this.updateGenPreview(dataUrl);
   }
 
   downloadResult(dataUrl: string, idx: number): void {
     downloadDataUrl(dataUrl, `${this.pipeline.characterName() || 'sprite'}_gen_${idx + 1}.png`);
   }
 
-  private updateGenPreview(dataUrl: string): void {
-    const canvas = this.sgCanvasRef?.nativeElement;
-    if (!canvas) return;
-    const ctx = canvas.getContext('2d')!;
-    const img = new Image();
-    img.onload = () => {
-      ctx.clearRect(0, 0, 1280, 720);
-      const scale = Math.min(1280 / img.width, 720 / img.height);
-      const w = img.width * scale;
-      const h = img.height * scale;
-      ctx.drawImage(img, (1280 - w) / 2, (720 - h) / 2, w, h);
-    };
-    img.src = dataUrl;
-  }
-
-  genHandoffToVideoGen(): void {
-    const selected = this.selectedResult();
-    if (!selected) {
+  async genHandoffToVideoGen(): Promise<void> {
+    if (!this.selectedResult()) {
       this.toast.show('Select a sprite first', 'warning');
       return;
     }
-    const blob = base64ToBlob(selected);
-    this.pipeline.handoffSprite({ blob, base64: selected, keyColor: this.keyColor() });
-    this.toast.show('Sprite sent to Generate Video', 'success');
-    void this.router.navigate(['/video-gen']);
+    const editor = this.genEditor;
+    if (!editor) {
+      this.toast.show('Frame editor not ready', 'warning');
+      return;
+    }
+    try {
+      const frame = await editor.exportFrame();
+      if (!frame) {
+        this.toast.show('Could not prepare sprite for handoff', 'error');
+        return;
+      }
+      this.pipeline.handoffSprite({
+        blob: frame.blob,
+        base64: frame.base64,
+        keyColor: this.keyColor(),
+      });
+      this.toast.show('Sprite sent to Generate Video', 'success');
+      void this.router.navigate(['/video-gen']);
+    } catch (err) {
+      this.toast.show('Handoff failed: ' + (err as Error).message, 'error');
+    }
   }
 
   async genHandoffToManual(): Promise<void> {
-    const selected = this.selectedResult();
-    if (!selected) {
+    if (!this.selectedResult()) {
       this.toast.show('Select a sprite first', 'warning');
       return;
     }
-    const img = await loadImage(selected);
-    this.spriteImage = img;
-    this.spriteFileName = (this.pipeline.characterName() || 'sprite') + '_gen';
-    this.hasSprite.set(true);
-    this.offset.set(0);
-    this.zoom.set(100);
-    localStorage.setItem('sp-offset', '0');
-    localStorage.setItem('sp-zoom', '100');
-    this.applyAutoKeyColor(img);
-    this.mode.set('manual');
-    this.scheduleRender();
-    this.toast.show('Sprite loaded into Manual Upload — adjust offset & zoom', 'success');
+    const editor = this.genEditor;
+    if (!editor) {
+      this.toast.show('Frame editor not ready', 'warning');
+      return;
+    }
+    try {
+      const frame = await editor.exportFrame();
+      if (!frame) {
+        this.toast.show('Could not prepare sprite', 'error');
+        return;
+      }
+      this.manualImageSrc.set(frame.base64);
+      this.spriteFileName = (this.pipeline.characterName() || 'sprite') + '_gen';
+      const img = await loadImage(frame.base64);
+      this.applyAutoKeyColor(img);
+      this.mode.set('manual');
+      this.toast.show('Framed sprite loaded into Manual Upload', 'success');
+    } catch (err) {
+      this.toast.show('Failed to send to Manual: ' + (err as Error).message, 'error');
+    }
   }
 
   async openAdvancedKey(): Promise<void> {

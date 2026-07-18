@@ -35,7 +35,7 @@ export class ApiService {
     const id = opts.provider || sel.provider?.id;
     if (!id) {
       throw new Error(
-        'No image provider available. Add an OpenAI, Gemini, or xAI (Grok) API key in Settings.'
+        'No image provider available. Add an OpenAI, Gemini, or xAI (Grok) key — or log in with SuperGrok — in Settings.'
       );
     }
     const def = IMAGE_PROVIDERS.find((p) => p.id === id);
@@ -113,8 +113,8 @@ export class ApiService {
     aspectRatio?: string,
     resolution?: string
   ): Promise<string> {
-    const key = this.settings.xaiKey();
-    if (!key) throw new Error('No xAI API key. Go to Settings to add one.');
+    const key = await this.settings.getXaiBearerToken();
+    if (!key) throw new Error(this.settings.xaiMissingCredentialMessage());
 
     const model = modelId || 'grok-imagine-image-quality';
     const hasImages = !!images?.length;
@@ -131,13 +131,27 @@ export class ApiService {
 
     if (hasImages && images) {
       // Downscale large refs — multi-MB data-URIs trigger TLS failures on the proxy hop to xAI.
-      // xAI edits expect data-URI / URL *strings* (not { url, type } objects when using an array).
-      const urls: string[] = [];
+      // REST shape: image is { url, type? } for one ref; images is [{ url }, ...] for multi-ref
+      // (mutually exclusive). Bare data-URI strings are rejected by xAI.
+      // Docs: https://docs.x.ai/developers/rest-api-reference/inference/images
+      const refs: Array<{ url: string; type: string }> = [];
       for (const img of images.slice(0, 3)) {
-        urls.push(await this.downscaleDataUrlForXai(this.ensureDataUrl(img.data)));
+        const url = await this.downscaleDataUrlForXai(this.ensureDataUrl(img.data));
+        refs.push({ url, type: 'image_url' });
       }
-      // One ref → string; multiple → string[] (image[i] must be strings)
-      body['image'] = urls.length === 1 ? urls[0] : urls;
+      if (refs.length === 1) {
+        body['image'] = refs[0];
+      } else {
+        body['images'] = refs;
+        // Multi-ref edits: xAI maps images by index as <IMAGE_0>, <IMAGE_1>, …
+        const orderHint = images
+          .slice(0, refs.length)
+          .map((img, i) => `<IMAGE_${i}> = ${img.label || `reference_${i}`}`)
+          .join('; ');
+        body['prompt'] =
+          `${String(body['prompt'] || '')}\n\nReference images (in order): ${orderHint}. ` +
+          `Use <IMAGE_0>, <IMAGE_1>, etc. when referring to a specific source.`;
+      }
     }
 
     try {
@@ -515,7 +529,7 @@ export class ApiService {
     const id = opts.provider || sel.provider?.id;
     if (!id) {
       throw new Error(
-        'No video provider available. Add a Gemini or xAI (Grok) API key in Settings.'
+        'No video provider available. Add a Gemini or xAI (Grok) key — or log in with SuperGrok — in Settings.'
       );
     }
     const def = VIDEO_PROVIDERS.find((p) => p.id === id);
@@ -552,8 +566,8 @@ export class ApiService {
     },
     modelId: string
   ): Promise<GeneratedVideo> {
-    const apiKey = this.settings.xaiKey();
-    if (!apiKey) throw new Error('No xAI API key. Go to Settings to add one.');
+    const apiKey = await this.settings.getXaiBearerToken();
+    if (!apiKey) throw new Error(this.settings.xaiMissingCredentialMessage());
 
     // Grok video duration is 1–15s
     const seconds = Math.min(15, Math.max(1, Math.round(Number(opts.duration) || 5)));

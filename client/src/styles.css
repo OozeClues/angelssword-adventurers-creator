@@ -610,6 +610,21 @@ body::before {
     border-color: rgba(255, 255, 255, 0.2);
 }
 
+/* Outline gold — unselected result "Select" state */
+.btn-outline-gold {
+    background: transparent;
+    color: var(--accent-gold);
+    border-color: var(--accent-gold);
+    font-weight: 600;
+}
+
+.btn-outline-gold:hover {
+    background: rgba(219, 184, 88, 0.12);
+    border-color: var(--accent-gold-soft, var(--accent-gold));
+    color: var(--accent-gold-soft, var(--accent-gold));
+    box-shadow: 0 0 8px var(--accent-gold-glow, rgba(219, 184, 88, 0.25));
+}
+
 /* Danger */
 .btn-danger {
     background: rgba(233, 69, 96, 0.1);

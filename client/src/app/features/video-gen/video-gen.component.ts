@@ -61,10 +61,13 @@ export class VideoGenComponent implements OnDestroy {
   readonly videoProviderNote = computed(() => {
     const sel = this.settings.videoProviderSelection();
     if (!sel.provider) {
-      return 'No video API keys set. Add a Gemini or xAI (Grok) API key in Settings.';
+      return 'No video providers ready. Add a Gemini or xAI key — or log in with SuperGrok — in Settings.';
     }
     if (sel.fellBack) {
       return `Using ${sel.provider.label} (fallback — preferred provider has no API key).`;
+    }
+    if (sel.provider.keyProvider === 'xai') {
+      return `${sel.provider.label} via ${this.settings.xaiBackendLabel()} · configure in Settings`;
     }
     if (sel.provider.recommended) {
       return `${sel.provider.label} · recommended for VTuber animation`;
@@ -121,7 +124,8 @@ export class VideoGenComponent implements OnDestroy {
   readonly generating = signal(false);
   readonly genStatus = signal<{ type: string; text: string } | null>(null);
   readonly videos = signal<GeneratedVideo[]>([]);
-  readonly selected = signal<Set<number>>(new Set());
+  /** Single result chosen to hand off to Video Prep (index into videos()). */
+  readonly selectedIndex = signal<number | null>(null);
   readonly startFrame = signal<string | null>(null);
   readonly endFrame = signal<string | null>(null);
 
@@ -297,7 +301,10 @@ export class VideoGenComponent implements OnDestroy {
     }
     const sel = this.settings.videoProviderSelection();
     if (!sel.provider) {
-      this.toast.show('Add a Gemini or xAI (Grok) API key in Settings first', 'warning');
+      this.toast.show(
+        'Add a Gemini or xAI key — or log in with SuperGrok — in Settings first',
+        'warning'
+      );
       return;
     }
 
@@ -355,7 +362,7 @@ export class VideoGenComponent implements OnDestroy {
         if (v.url.startsWith('blob:')) URL.revokeObjectURL(v.url);
       }
       this.videos.set(ok);
-      this.selected.set(ok.length ? new Set([0]) : new Set());
+      this.selectedIndex.set(ok.length ? 0 : null);
 
       if (ok.length > 0) {
         this.sound.play();
@@ -383,15 +390,13 @@ export class VideoGenComponent implements OnDestroy {
     this.toast.show('Generation cancelled', 'warning');
   }
 
-  toggleSelect(idx: number): void {
-    const next = new Set(this.selected());
-    if (next.has(idx)) next.delete(idx);
-    else next.add(idx);
-    this.selected.set(next);
+  /** Exclusive single selection for pipeline handoff. */
+  selectVideo(idx: number): void {
+    this.selectedIndex.set(idx);
   }
 
   isSelected(idx: number): boolean {
-    return this.selected().has(idx);
+    return this.selectedIndex() === idx;
   }
 
   downloadVideo(idx: number): void {
@@ -411,11 +416,11 @@ export class VideoGenComponent implements OnDestroy {
   }
 
   async handoffToVideoPrep(): Promise<void> {
-    if (this.selected().size === 0) {
-      this.toast.show('Select at least one video first', 'warning');
+    const idx = this.selectedIndex();
+    if (idx === null) {
+      this.toast.show('Select a video first', 'warning');
       return;
     }
-    const idx = Array.from(this.selected())[0];
     const video = this.videos()[idx];
     if (!video) return;
 

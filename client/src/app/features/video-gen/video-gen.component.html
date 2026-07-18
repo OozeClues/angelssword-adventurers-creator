@@ -64,7 +64,7 @@
                 default for image-to-video and keyframe animation in this pipeline.
               </p>
               <p class="api-setup-nudge-alt">
-                Also supported: Grok Imagine Video (image-to-video; no dual keyframe mode).
+                Also supported: Grok Imagine Video via API key or SuperGrok OAuth (image-to-video; no dual keyframe mode).
               </p>
               <button type="button" class="btn btn-sm btn-primary" (click)="goToSettings()">
                 Open Settings
@@ -217,10 +217,10 @@
                   type="button"
                   class="btn btn-sm"
                   [class.btn-primary]="isSelected(i)"
-                  [class.btn-secondary]="!isSelected(i)"
-                  (click)="toggleSelect(i)"
+                  [class.btn-outline-gold]="!isSelected(i)"
+                  (click)="selectVideo(i)"
                 >
-                  {{ isSelected(i) ? '✓ Selected' : '○ Select' }}
+                  {{ isSelected(i) ? '✓ Selected' : 'Select' }}
                 </button>
               </div>
             </div>
@@ -235,14 +235,26 @@
 
   <aside class="main-layout-sidebar">
     <div class="glass-panel">
-      <div class="panel-title"><span class="title-icon">ℹ️</span> About Gemini Omni Flash</div>
+      <div class="panel-title"><span class="title-icon">ℹ️</span> About Generate Video</div>
       <div class="panel-subtitle">
-        Google's Gemini Omni Flash generates short animated videos from reference images and text prompts. Perfect for
-        creating idle animations, talking motions, and simple character movements.
+        Turn a still reference (sprite or photo) into a short animated clip using online video models — ideal for idle
+        loops, talking motions, and simple character movement before you refine the loop in Video Prep.
+      </div>
+      <div class="panel-subtitle mt-1">
+        <strong class="text-gold">Why Gemini is preferred:</strong> Gemini Omni Flash is the recommended default here —
+        it supports image-to-video and true start+end keyframe mode, and the stock animation prompt is tuned for it. You
+        can still switch to Grok Imagine Video (API key or SuperGrok) when that fits your setup better.
+      </div>
+      <div class="panel-subtitle mt-1">
+        <strong class="text-gold">Editing the prompt:</strong> Replace
+        <span class="text-mono">(Character description)</span> with a simple note about the character and their mood, and
+        <span class="text-mono">(Animation Type)</span> with a minimal description of the actions they perform in the
+        loop. Keep the camera-lock constraints unless you intentionally want camera motion.
       </div>
       <div class="settings-info">
         <span class="info-icon">🔑</span>
-        Requires a Google Gemini API key. Set it up in the <strong>Settings</strong> tab.
+        Configure Gemini, Grok API key, or SuperGrok OAuth in the <strong>Settings</strong> tab. Or skip this step and
+        upload your own video in Video Prep.
       </div>
     </div>
   </aside>

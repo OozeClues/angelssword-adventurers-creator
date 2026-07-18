@@ -400,6 +400,77 @@ app.post('/api/video/poll', async (req, res) => {
 });
 
 // --- xAI Grok Imagine proxies ---
+//
+// API-key and SuperGrok OAuth both send Authorization: Bearer <token> on generation
+// routes. OAuth device/token exchange is proxied here so the browser never talks to
+// auth.x.ai directly (CORS + keeps the public client id in one place).
+
+/** Public device-code client used by CLI-style SuperGrok tools (not a secret). */
+const XAI_OAUTH_CLIENT_ID = 'b1a00492-073a-47ea-816f-4c329264a828';
+const XAI_OAUTH_SCOPE = 'openid profile email offline_access grok-cli:access api:access';
+const XAI_DEVICE_CODE_URL = 'https://auth.x.ai/oauth2/device/code';
+const XAI_TOKEN_URL = 'https://auth.x.ai/oauth2/token';
+
+/**
+ * POST /api/xai/oauth/device — start SuperGrok device-code login
+ */
+app.post('/api/xai/oauth/device', async (req, res) => {
+    try {
+        console.log('  [PROXY] POST /api/xai/oauth/device → auth.x.ai device/code');
+        const body = new URLSearchParams({
+            client_id: XAI_OAUTH_CLIENT_ID,
+            scope: XAI_OAUTH_SCOPE,
+            referrer: 'as-adventurer',
+        });
+        const response = await fetch(XAI_DEVICE_CODE_URL, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'x-grok-client-version': '1.0.0',
+                'x-grok-client-surface': 'cli',
+            },
+            body: body.toString(),
+        });
+        const data = await response.text();
+        console.log(`  [PROXY] xAI device/code → ${response.status}`);
+        res.status(response.status).type('application/json').send(data);
+    } catch (err) {
+        console.error('  [ERROR] xAI OAuth device failed:', err.message);
+        res.status(502).json({ error: `Proxy error: ${err.message}` });
+    }
+});
+
+/**
+ * POST /api/xai/oauth/token — device_code poll or refresh_token exchange
+ * Body JSON: { grant_type, device_code? } or { grant_type: 'refresh_token', refresh_token }
+ */
+app.post('/api/xai/oauth/token', async (req, res) => {
+    try {
+        const grantType = (req.body && req.body.grant_type) || '(missing)';
+        console.log(`  [PROXY] POST /api/xai/oauth/token → auth.x.ai  grant_type=${grantType}`);
+        const params = new URLSearchParams({
+            client_id: XAI_OAUTH_CLIENT_ID,
+            ...(req.body || {}),
+        });
+        if (!params.has('client_id')) params.set('client_id', XAI_OAUTH_CLIENT_ID);
+
+        const response = await fetch(XAI_TOKEN_URL, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'x-grok-client-version': '1.0.0',
+                'x-grok-client-surface': 'cli',
+            },
+            body: params.toString(),
+        });
+        const data = await response.text();
+        console.log(`  [PROXY] xAI token → ${response.status}`);
+        res.status(response.status).type('application/json').send(data);
+    } catch (err) {
+        console.error('  [ERROR] xAI OAuth token failed:', err.message);
+        res.status(502).json({ error: `Proxy error: ${err.message}` });
+    }
+});
 
 /**
  * Normalize Authorization for xAI: always "Bearer <key>", strip quotes / double Bearer.
