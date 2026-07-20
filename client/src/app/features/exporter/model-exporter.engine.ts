@@ -3,7 +3,11 @@
 // Ported from legacy/public/model-exporter.js — UI wiring uses __hooks injected at runtime.
 import { ChromaKey } from './chroma-key';
 export { ChromaKey };
-import { ChromaWorkerPool } from './chroma-worker-pool';
+import {
+  createChromaProcessor,
+  createDomPngEncoder,
+  type ChromaFrameProcessor,
+} from './chroma-backend';
 
 export type ExporterHooks = {
   showToast: (msg: string, type?: string) => void;
@@ -742,6 +746,24 @@ export class ModelExporter {
         this.workCanvas = null;
         this.workCtx = null;
 
+        // WebGPU interactive preview (null=untried, false=unavailable, processor=ready)
+        this._previewGpu = null;
+        this._previewGpuReady = false;
+        this._previewGen = 0;
+        this._keyPreviewTimer = null;
+        this._keyPreviewFullTimer = null;
+        /** Half-res canvas for fast GPU scrub (created lazily). */
+        this._previewLoCanvas = null;
+        this._previewLoCtx = null;
+        /** Fraction of full resolution used while scrubbing / playing. */
+        this._previewScrubScale = 0.5;
+        /**
+         * Low-res *keyed* scrub thumbnails only (frame index → ImageData at half-res).
+         * Full-res is never cached — settle always seeks + processes live.
+         */
+        this._scrubLoCache = new Map();
+        this._scrubLoCacheMax = 48;
+
         // Scale/offset
         this.videoScale = 1;
         this.videoOffset = 0;
@@ -839,12 +861,13 @@ export class ModelExporter {
 
         this.chromaKey.setKeyColor(rgb.r, rgb.g, rgb.b);
         this._selectSwatch(h);
+        this._scrubLoCache?.clear();
 
         if (opts.persist !== false && typeof __hooks.setKeyColor === 'function') {
             __hooks.setKeyColor(h);
         }
         if (opts.preview !== false && this.videoLoaded) {
-            this.updatePreview();
+            this.updatePreview({ quality: 'full' });
         }
         if (opts.toast) {
             __hooks.showToast(opts.toast, 'success');
@@ -1146,6 +1169,7 @@ export class ModelExporter {
         // when the user uploads a file directly.
         this._pendingVideoMeta = meta || null;
         this.detectedFps = meta?.fps ? Number(meta.fps) : null;
+        this._scrubLoCache?.clear();
 
         if (this._videoObjectUrl) {
             try {
@@ -1426,15 +1450,20 @@ export class ModelExporter {
 
     // ─── SLIDERS ───
     bindSliders() {
-        const debounced = __hooks.debounce(() => this.updatePreview(), 150);
+        const debounced = __hooks.debounce(() => this.updatePreview({ quality: 'full' }), 150);
+        const onKeyParam = () => {
+            // Keyed lo-res thumbs are invalid when key params change.
+            this._scrubLoCache?.clear();
+            this.persistSliders();
+            debounced();
+        };
 
         // Similarity
         const simSlider = document.getElementById('exSimilarity');
         simSlider.addEventListener('input', () => {
             document.getElementById('exSimilarityVal').textContent = simSlider.value + '%';
             this.chromaKey.similarity = parseInt(simSlider.value) / 100;
-            this.persistSliders();
-            debounced();
+            onKeyParam();
         });
 
         // Smoothness
@@ -1442,8 +1471,7 @@ export class ModelExporter {
         smoothSlider.addEventListener('input', () => {
             document.getElementById('exSmoothnessVal').textContent = smoothSlider.value + '%';
             this.chromaKey.smoothness = parseInt(smoothSlider.value) / 100;
-            this.persistSliders();
-            debounced();
+            onKeyParam();
         });
 
         // Spill Suppression
@@ -1451,8 +1479,7 @@ export class ModelExporter {
         spillSlider.addEventListener('input', () => {
             document.getElementById('exSpillSuppressVal').textContent = spillSlider.value + '%';
             this.chromaKey.spillSuppression = parseInt(spillSlider.value) / 100;
-            this.persistSliders();
-            debounced();
+            onKeyParam();
         });
 
         // Scale
@@ -1460,6 +1487,7 @@ export class ModelExporter {
         scaleSlider.addEventListener('input', () => {
             document.getElementById('exScaleVal').textContent = scaleSlider.value + '%';
             this.videoScale = parseInt(scaleSlider.value) / 100;
+            this._scrubLoCache?.clear();
             this.persistSliders();
             debounced();
         });
@@ -1469,6 +1497,7 @@ export class ModelExporter {
         vOffsetSlider.addEventListener('input', () => {
             document.getElementById('exVOffsetVal').textContent = vOffsetSlider.value + 'px';
             this.videoOffset = parseInt(vOffsetSlider.value);
+            this._scrubLoCache?.clear();
             this.persistSliders();
             debounced();
         });
@@ -1804,21 +1833,29 @@ export class ModelExporter {
         scrubber.addEventListener('input', () => {
             if (this.isPlaying) this.stopPlayback();
             this.currentFrame = parseInt(scrubber.value);
-            this.seekToFrame(this.currentFrame);
+            this.seekToFrame(this.currentFrame, { quality: 'fast' });
         });
+
+        // Pointer released / keyboard commit → full-resolution key
+        const settleFull = () => {
+            if (!this.videoLoaded || this.previewMode === 'original') return;
+            this.updatePreview({ quality: 'full' });
+        };
+        scrubber.addEventListener('change', settleFull);
+        scrubber.addEventListener('pointerup', settleFull);
 
         prevBtn.addEventListener('click', () => {
             if (this.isPlaying) this.stopPlayback();
             this.currentFrame = Math.max(0, this.currentFrame - 1);
             document.getElementById('exScrubber').value = this.currentFrame;
-            this.seekToFrame(this.currentFrame);
+            this.seekToFrame(this.currentFrame, { quality: 'full' });
         });
 
         nextBtn.addEventListener('click', () => {
             if (this.isPlaying) this.stopPlayback();
             this.currentFrame = Math.min(this.totalFrames - 1, this.currentFrame + 1);
             document.getElementById('exScrubber').value = this.currentFrame;
-            this.seekToFrame(this.currentFrame);
+            this.seekToFrame(this.currentFrame, { quality: 'full' });
         });
     }
 
@@ -1833,7 +1870,8 @@ export class ModelExporter {
             if (this.currentFrame >= this.totalFrames) {
                 this.currentFrame = 0;
             }
-            this.seekToFrame(this.currentFrame);
+            // Half-res keyed frames keep playback closer to realtime.
+            this.seekToFrame(this.currentFrame, { quality: 'fast' });
             document.getElementById('exScrubber').value = this.currentFrame;
         }, frameInterval);
     }
@@ -1845,32 +1883,112 @@ export class ModelExporter {
             clearInterval(this.playTimer);
             this.playTimer = null;
         }
+        // Settle to full-res key on the paused frame.
+        if (this.videoLoaded && this.previewMode !== 'original') {
+            this.updatePreview({ quality: 'full' });
+        }
     }
 
-    seekToFrame(frameNum) {
+    /**
+     * @param {number} frameNum
+     * @param {{ quality?: 'fast' | 'full' }} [opts]
+     */
+    seekToFrame(frameNum, opts = {}) {
+        const quality = opts.quality || 'full';
         const time = frameNum / this.fps;
         const targetTime = Math.min(time, this.duration - 0.001);
         this.updateFrameInfo();
 
-        if (Math.abs(this.video.currentTime - targetTime) < 0.001) {
+        // Fast scrub: show lo-res keyed thumbnail immediately if we have one (avoids blank flash).
+        const hasLo =
+            quality === 'fast' &&
+            this.previewMode !== 'original' &&
+            this._scrubLoCache?.has(frameNum);
+        if (hasLo) {
+            const lo = this._scrubLoCache.get(frameNum);
+            if (lo) {
+                this._blitKeyedPreview(lo, lo.width, lo.height, this.videoWidth, this.videoHeight, true);
+            }
+        }
+
+        const paintUnkeyedShell = () => {
+            // Skip unkeyed draw when a lo-res keyed thumb is already on screen.
+            if (hasLo) return;
             this.previewCtx.drawImage(this.video, 0, 0, this.videoWidth, this.videoHeight);
-            this._debouncedKeyPreview();
+        };
+
+        if (Math.abs(this.video.currentTime - targetTime) < 0.001) {
+            paintUnkeyedShell();
+            this._debouncedKeyPreview(quality);
             return;
         }
 
         this.video.currentTime = targetTime;
         this.video.addEventListener('seeked', () => {
-            this.previewCtx.drawImage(this.video, 0, 0, this.videoWidth, this.videoHeight);
-            this._debouncedKeyPreview();
+            paintUnkeyedShell();
+            this._debouncedKeyPreview(quality);
         }, { once: true });
     }
 
-    // Debounced keyed preview — only runs ChromaKey 200ms after last seek
-    _debouncedKeyPreview() {
+    /**
+     * Debounced keyed preview.
+     * - fast: half-res GPU (or CPU) key for scrub/play
+     * - full: native-res key after settle
+     * @param {'fast' | 'full'} [quality]
+     */
+    _debouncedKeyPreview(quality = 'full') {
         if (this._keyPreviewTimer) clearTimeout(this._keyPreviewTimer);
+        if (this._keyPreviewFullTimer) clearTimeout(this._keyPreviewFullTimer);
+
+        if (quality === 'fast') {
+            // Near-immediate half-res key while dragging / playing.
+            const delay = this._previewGpuReady ? 16 : 80;
+            this._keyPreviewTimer = setTimeout(() => {
+                this.updatePreview({ quality: 'fast' });
+            }, delay);
+            // After interaction pauses, refine at full resolution.
+            this._keyPreviewFullTimer = setTimeout(() => {
+                if (!this.isPlaying) this.updatePreview({ quality: 'full' });
+            }, 320);
+            return;
+        }
+
+        const delay = this._previewGpuReady ? 40 : 160;
         this._keyPreviewTimer = setTimeout(() => {
-            this.updatePreview();
-        }, 200);
+            this.updatePreview({ quality: 'full' });
+        }, delay);
+    }
+
+    /** Lazy-init shared WebGPU chroma for interactive preview (not multi-frame export). */
+    async _ensurePreviewGpu() {
+        // Settings → CPU only: fully disable WebGPU for preview + export.
+        if (
+            typeof localStorage !== 'undefined' &&
+            localStorage.getItem('as_export_accel') === 'cpu'
+        ) {
+            this._previewGpu = false;
+            this._previewGpuReady = false;
+            try {
+                const { disposeSharedPreviewWebGpu } = await import('./chroma-webgpu');
+                disposeSharedPreviewWebGpu();
+            } catch {
+                /* ignore */
+            }
+            return null;
+        }
+        if (this._previewGpu === false) return null;
+        if (this._previewGpu && this._previewGpu.isUsable) return this._previewGpu;
+        try {
+            const { getSharedPreviewWebGpu } = await import('./chroma-webgpu');
+            const gpu = await getSharedPreviewWebGpu();
+            this._previewGpu = gpu || false;
+            this._previewGpuReady = !!gpu;
+            return gpu;
+        } catch {
+            this._previewGpu = false;
+            this._previewGpuReady = false;
+            return null;
+        }
     }
 
     updateFrameInfo() {
@@ -1913,13 +2031,21 @@ export class ModelExporter {
     }
 
     // ─── PREVIEW RENDERING ───
-    updatePreview() {
+    /**
+     * @param {{ quality?: 'fast' | 'full' }} [opts]
+     *   fast = half-res key (scrub/play), optionally from lo-res scrub cache
+     *   full = live seek frame at native res + full key (never from full-res cache)
+     */
+    updatePreview(opts = {}) {
         if (!this.videoLoaded) return;
 
+        const quality = opts.quality || 'full';
         const w = this.videoWidth;
         const h = this.videoHeight;
         const scale = this.videoScale || 1;
         const vOffset = this.videoOffset || 0;
+        const scrubScale =
+            quality === 'fast' ? this._previewScrubScale || 0.5 : 1;
 
         if (this.previewMode === 'original') {
             this.previewCtx.clearRect(0, 0, w, h);
@@ -1931,29 +2057,154 @@ export class ModelExporter {
             return;
         }
 
-        // Draw video scaled + centered to work canvas
-        this.workCtx.clearRect(0, 0, w, h);
-        const sw = Math.round(w * scale);
-        const sh = Math.round(h * scale);
-        const dx = Math.round((w - sw) / 2);
-        const dy = Math.round((h - sh) / 2) + vOffset;
-        this.workCtx.drawImage(this.video, 0, 0, this.video.videoWidth, this.video.videoHeight, dx, dy, sw, sh);
-        const imageData = this.workCtx.getImageData(0, 0, w, h);
+        // Process dimensions (half-res while scrubbing / playing).
+        const pw = Math.max(1, Math.round(w * scrubScale));
+        const ph = Math.max(1, Math.round(h * scrubScale));
 
-        // Apply chroma key
-        this.chromaKey.process(imageData);
-
-        // Apply anti-aliasing if enabled
-        if (this.chromaKey.antiAlias) {
-            this.chromaKey.applyAntiAlias(imageData);
+        // Fast path: reuse lo-res *keyed* scrub thumbnail if present (no re-key).
+        if (quality === 'fast' && this._scrubLoCache?.has(this.currentFrame)) {
+            const lo = this._scrubLoCache.get(this.currentFrame);
+            if (lo && lo.width === pw && lo.height === ph) {
+                this._blitKeyedPreview(lo, pw, ph, w, h, true);
+                return;
+            }
         }
 
-        // Apply edge fade if enabled
-        this.chromaKey.applyEdgeFade(imageData, this.chromaKey.edgeFadeWidth);
+        let srcCtx = this.workCtx;
+        if (scrubScale < 1) {
+            if (!this._previewLoCanvas) {
+                this._previewLoCanvas = document.createElement('canvas');
+                this._previewLoCtx = this._previewLoCanvas.getContext('2d', {
+                    willReadFrequently: true,
+                });
+            }
+            if (this._previewLoCanvas.width !== pw || this._previewLoCanvas.height !== ph) {
+                this._previewLoCanvas.width = pw;
+                this._previewLoCanvas.height = ph;
+            }
+            srcCtx = this._previewLoCtx;
+        }
 
-        // Clear preview and render
-        this.previewCtx.clearRect(0, 0, w, h);
-        this.previewCtx.putImageData(imageData, 0, 0);
+        // Always sample from the live video element (full path after settle seeks first).
+        srcCtx.clearRect(0, 0, pw, ph);
+        const sw = Math.round(pw * scale);
+        const sh = Math.round(ph * scale);
+        const dx = Math.round((pw - sw) / 2);
+        const dy = Math.round((ph - sh) / 2) + Math.round(vOffset * scrubScale);
+        srcCtx.drawImage(
+            this.video,
+            0,
+            0,
+            this.video.videoWidth,
+            this.video.videoHeight,
+            dx,
+            dy,
+            sw,
+            sh
+        );
+        const imageData = srcCtx.getImageData(0, 0, pw, ph);
+
+        // Prefer WebGPU for interactive keying; fall back to CPU ChromaKey.
+        const gen = ++this._previewGen;
+        const liveSettings = this.chromaKey.getSettings();
+        const settings = { ...liveSettings };
+        if (quality === 'fast') {
+            settings.edgeFadeWidth = Math.max(
+                0,
+                Math.round(settings.edgeFadeWidth * scrubScale)
+            );
+            settings.antiAlias = false;
+            settings.smokeCleanup = false;
+        }
+
+        const runCpuKey = () => {
+            this.chromaKey.applySettings(settings);
+            try {
+                this.chromaKey.process(imageData);
+                if (settings.antiAlias) this.chromaKey.applyAntiAlias(imageData);
+                this.chromaKey.applyEdgeFade(imageData, settings.edgeFadeWidth);
+            } finally {
+                this.chromaKey.applySettings(liveSettings);
+            }
+        };
+
+        void (async () => {
+            try {
+                const gpu = await this._ensurePreviewGpu();
+                if (gen !== this._previewGen) return;
+
+                if (gpu) {
+                    await gpu.processPreviewFrame(imageData, settings);
+                } else {
+                    runCpuKey();
+                }
+
+                if (gen !== this._previewGen || !this.videoLoaded) return;
+
+                if (quality === 'fast') {
+                    this._rememberScrubLo(this.currentFrame, imageData);
+                }
+
+                this._blitKeyedPreview(imageData, pw, ph, w, h, scrubScale < 1);
+            } catch (err) {
+                if (gen !== this._previewGen) return;
+                console.warn('[preview] GPU key failed, using CPU:', err);
+                this._previewGpu = false;
+                this._previewGpuReady = false;
+                try {
+                    runCpuKey();
+                    if (gen !== this._previewGen) return;
+                    if (quality === 'fast') {
+                        this._rememberScrubLo(this.currentFrame, imageData);
+                    }
+                    this._blitKeyedPreview(imageData, pw, ph, w, h, scrubScale < 1);
+                } catch (cpuErr) {
+                    console.error('[preview] CPU key failed:', cpuErr);
+                }
+            }
+        })();
+    }
+
+    /** Store a copy of a half-res keyed scrub frame (LRU-ish cap). */
+    _rememberScrubLo(frameIndex, imageData) {
+        if (!this._scrubLoCache) this._scrubLoCache = new Map();
+        const copy = new ImageData(
+            new Uint8ClampedArray(imageData.data),
+            imageData.width,
+            imageData.height
+        );
+        // Refresh insertion order
+        if (this._scrubLoCache.has(frameIndex)) this._scrubLoCache.delete(frameIndex);
+        this._scrubLoCache.set(frameIndex, copy);
+        while (this._scrubLoCache.size > (this._scrubLoCacheMax || 48)) {
+            const oldest = this._scrubLoCache.keys().next().value;
+            this._scrubLoCache.delete(oldest);
+        }
+    }
+
+    /**
+     * Draw keyed ImageData to the preview canvas (upscale if half-res scrub).
+     */
+    _blitKeyedPreview(imageData, pw, ph, fullW, fullH, upscale) {
+        if (!upscale) {
+            this.previewCtx.clearRect(0, 0, fullW, fullH);
+            this.previewCtx.putImageData(imageData, 0, 0);
+            return;
+        }
+        // putImageData into lo canvas, then scale up with bilinear filtering.
+        if (!this._previewLoCanvas) {
+            this._previewLoCanvas = document.createElement('canvas');
+            this._previewLoCtx = this._previewLoCanvas.getContext('2d');
+        }
+        if (this._previewLoCanvas.width !== pw || this._previewLoCanvas.height !== ph) {
+            this._previewLoCanvas.width = pw;
+            this._previewLoCanvas.height = ph;
+        }
+        this._previewLoCtx.putImageData(imageData, 0, 0);
+        this.previewCtx.clearRect(0, 0, fullW, fullH);
+        this.previewCtx.imageSmoothingEnabled = true;
+        this.previewCtx.imageSmoothingQuality = 'high';
+        this.previewCtx.drawImage(this._previewLoCanvas, 0, 0, pw, ph, 0, 0, fullW, fullH);
     }
 
     // ─── CROP OVERLAY ───
@@ -2634,13 +2885,43 @@ export class ModelExporter {
         let sessionId = null;
 
         try {
-            // ── Open server session (temp dir for streaming frames) ──
             progressText.textContent = 'Capturing · starting…';
             this._exportAbort = new AbortController();
             const signal = this._exportAbort.signal;
 
+            // Pick chroma backend first so the session can use raw RGBA (GPU) or PNG (CPU).
+            /** @type {ChromaFrameProcessor | null} */
+            let chromaProcessor = null;
+            /** @type {'png' | 'rgba'} */
+            let frameFormat = 'png';
+            try {
+                // prefer is resolved inside createChromaProcessor; CPU-only setting always wins.
+                chromaProcessor = await createChromaProcessor();
+                chromaProcessor.setRgbaEncoder?.(createDomPngEncoder());
+                if (
+                    chromaProcessor.backend === 'webgpu' &&
+                    typeof chromaProcessor.processToRawRgba === 'function'
+                ) {
+                    frameFormat = 'rgba';
+                }
+                console.info(
+                    `[export] chroma backend: ${chromaProcessor.backend}, frameFormat=${frameFormat}`
+                );
+            } catch (procErr) {
+                console.warn('[export] chroma processor unavailable, using main thread PNG:', procErr);
+                chromaProcessor = null;
+                frameFormat = 'png';
+            }
+
+            // ── Open server session (temp dir for streaming frames) ──
             const sessResp = await fetch('/api/export/session', {
                 method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(
+                    frameFormat === 'rgba'
+                        ? { format: 'rgba', width, height }
+                        : { format: 'png' }
+                ),
                 signal,
             });
             const sessBody = await sessResp.json().catch(() => ({}));
@@ -2663,7 +2944,7 @@ export class ModelExporter {
             sessionId = sessBody.sessionId;
             if (!sessionId) throw new Error('Server did not return an export session id');
 
-            // Single canvas: extract → chroma → PNG → upload. No ImageData array.
+            // Single canvas: extract → chroma → PNG/RGBA → upload.
             const recCanvas = document.createElement('canvas');
             recCanvas.width = width;
             recCanvas.height = height;
@@ -2720,7 +3001,9 @@ export class ModelExporter {
                 });
 
             // Upload pool: parallel POSTs. Processing never awaits these.
-            const UPLOAD_CONCURRENCY = 8;
+            // Raw RGBA is ~3.7MB/frame @ 720p; Brave (and some Chromium builds) drop
+            // concurrent large POSTs with opaque "Failed to fetch". Keep concurrency low.
+            const UPLOAD_CONCURRENCY = frameFormat === 'rgba' ? 2 : 4;
             /** @type {Promise<void>[]} */
             const allUploads = [];
             /** @type {Set<Promise<void>>} */
@@ -2805,20 +3088,40 @@ export class ModelExporter {
 
             /**
              * Fire-and-forget: returns immediately after queueing HTTP work.
+             * @param {number} index
+             * @param {Blob|ArrayBuffer} payload
+             * @param {string} [contentType]
              */
-            const scheduleUpload = (index, blob) => {
-                if (uploadError) throw uploadError;
-                if (this._exportCancelled) throw new Error('cancelled');
+            const isNetworkFetchError = (err) => {
+                if (!err) return false;
+                if (err.name === 'TypeError') return true;
+                const m = String(err.message || err);
+                return /failed to fetch|networkerror|load failed|network request failed/i.test(m);
+            };
 
-                const job = (async () => {
-                    await acquireSlot();
-                    const work = (async () => {
+            /**
+             * POST one frame with retries for transient Brave/Chromium network drops.
+             * Uses Blob bodies (more reliable than raw ArrayBuffer for large POSTs).
+             */
+            const uploadFrameOnce = async (index, payload, contentType) => {
+                let body = payload;
+                if (payload instanceof ArrayBuffer) {
+                    body = new Blob([payload], { type: contentType });
+                } else if (ArrayBuffer.isView?.(payload)) {
+                    body = new Blob([payload.buffer], { type: contentType });
+                }
+
+                const maxAttempts = 4;
+                let lastErr = null;
+                for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+                    if (this._exportCancelled) throw new Error('cancelled');
+                    try {
                         const resp = await fetch(
                             `/api/export/session/${sessionId}/frame?index=${index}`,
                             {
                                 method: 'POST',
-                                headers: { 'Content-Type': 'image/png' },
-                                body: blob,
+                                headers: { 'Content-Type': contentType },
+                                body,
                                 signal,
                             }
                         );
@@ -2830,8 +3133,42 @@ export class ModelExporter {
                             } catch (_) {
                                 /* ignore */
                             }
+                            // 4xx (except 408/429) are not retried
+                            if (resp.status >= 400 && resp.status < 500 && resp.status !== 408 && resp.status !== 429) {
+                                throw new Error(msg);
+                            }
                             throw new Error(msg);
                         }
+                        return;
+                    } catch (err) {
+                        lastErr = err;
+                        if (err?.name === 'AbortError' || err?.message === 'cancelled') throw err;
+                        const retryable = isNetworkFetchError(err) || /upload failed \(5|408|429/i.test(String(err?.message));
+                        if (!retryable || attempt === maxAttempts) {
+                            const base = err?.message || String(err);
+                            throw new Error(
+                                isNetworkFetchError(err)
+                                    ? `Network error uploading frame ${index}: ${base}. ` +
+                                      `Often caused by too many large concurrent uploads (Brave/privacy tools). ` +
+                                      `Retry export, or set Settings → Export acceleration → CPU only.`
+                                    : base
+                            );
+                        }
+                        // Exponential backoff: 200ms, 400ms, 800ms
+                        await new Promise((r) => setTimeout(r, 200 * Math.pow(2, attempt - 1)));
+                    }
+                }
+                throw lastErr || new Error(`Frame ${index} upload failed`);
+            };
+
+            const scheduleUpload = (index, payload, contentType = 'image/png') => {
+                if (uploadError) throw uploadError;
+                if (this._exportCancelled) throw new Error('cancelled');
+
+                const job = (async () => {
+                    await acquireSlot();
+                    const work = (async () => {
+                        await uploadFrameOnce(index, payload, contentType);
                         uploaded++;
                         uploadsDone = uploaded;
                         renderProgress();
@@ -2853,35 +3190,13 @@ export class ModelExporter {
             };
 
             // ── Phase 1: Capture + prep each unique source; queue uploads ──
-            // Chroma + PNG run on a worker pool (overlaps with seek/capture).
+            // GPU: key + raw RGBA. CPU: key + PNG. Process slots overlap seek.
             phase = 'capturing';
             renderProgress(true);
 
-            /** @type {ChromaWorkerPool | null} */
-            let chromaPool = null;
-            try {
-                chromaPool = new ChromaWorkerPool();
-                chromaPool.setRgbaEncoder(async (w, h, buf) => {
-                    // Per-call canvas — safe under concurrent done-rgba fallbacks
-                    const c = document.createElement('canvas');
-                    c.width = w;
-                    c.height = h;
-                    const ctx = c.getContext('2d');
-                    if (!ctx) throw new Error('Canvas 2D unavailable');
-                    ctx.putImageData(new ImageData(new Uint8ClampedArray(buf), w, h), 0, 0);
-                    return new Promise((resolve, reject) => {
-                        c.toBlob(
-                            (blob) => (blob ? resolve(blob) : reject(new Error('PNG encode failed'))),
-                            'image/png'
-                        );
-                    });
-                });
-            } catch (poolErr) {
-                console.warn('[export] chroma worker pool unavailable, using main thread:', poolErr);
-                chromaPool = null;
-            }
-
-            const PROCESS_SLOTS = chromaPool ? chromaPool.size + 1 : 1;
+            const PROCESS_SLOTS = chromaProcessor
+                ? Math.max(2, chromaProcessor.concurrency + 1)
+                : 1;
             let processFree = PROCESS_SLOTS;
             /** @type {Array<() => void>} */
             const processWaiters = [];
@@ -2924,18 +3239,35 @@ export class ModelExporter {
                             try {
                                 if (this._exportCancelled) throw new Error('cancelled');
 
-                                let pngBlob;
-                                if (chromaPool) {
-                                    // Transfers imageData buffer — do not touch imageData after.
-                                    pngBlob = await chromaPool.processToPng(imageData, chromaSettings);
+                                if (frameFormat === 'rgba' && chromaProcessor?.processToRawRgba) {
+                                    // GPU (or CPU) key → raw RGBA — no PNG compress.
+                                    const raw = await chromaProcessor.processToRawRgba(
+                                        imageData,
+                                        chromaSettings
+                                    );
+                                    for (const fi of exportIndices) {
+                                        // Clone buffer per upload index if shared (ping-pong).
+                                        const body =
+                                            exportIndices.length > 1
+                                                ? raw.buffer.slice(0)
+                                                : raw.buffer;
+                                        scheduleUpload(fi, body, 'application/octet-stream');
+                                    }
                                 } else {
-                                    this.chromaKey.processExportFrame(imageData);
-                                    encCtx.putImageData(imageData, 0, 0);
-                                    pngBlob = await canvasToPngBlob();
-                                }
-
-                                for (const fi of exportIndices) {
-                                    scheduleUpload(fi, pngBlob);
+                                    let pngBlob;
+                                    if (chromaProcessor) {
+                                        pngBlob = await chromaProcessor.processToPng(
+                                            imageData,
+                                            chromaSettings
+                                        );
+                                    } else {
+                                        this.chromaKey.processExportFrame(imageData);
+                                        encCtx.putImageData(imageData, 0, 0);
+                                        pngBlob = await canvasToPngBlob();
+                                    }
+                                    for (const fi of exportIndices) {
+                                        scheduleUpload(fi, pngBlob, 'image/png');
+                                    }
                                 }
 
                                 framesDone = Math.min(uniqueTotal, framesDone + 1);
@@ -3024,9 +3356,9 @@ export class ModelExporter {
 
                 if (__hooks.notificationSound) __hooks.notificationSound.play();
             } finally {
-                if (chromaPool) {
-                    chromaPool.terminate();
-                    chromaPool = null;
+                if (chromaProcessor) {
+                    chromaProcessor.dispose();
+                    chromaProcessor = null;
                 }
             }
         } catch (err) {
@@ -3196,14 +3528,15 @@ export class ModelExporter {
             phase = 'processing';
             renderProgress(true);
 
-            // Parallel chroma on worker pool when available (RGBA only; quantize on main)
-            /** @type {ChromaWorkerPool | null} */
-            let gifChromaPool = null;
+            // Chroma: WebGPU when available, else CPU workers (RGBA only; quantize on main)
+            /** @type {ChromaFrameProcessor | null} */
+            let gifChromaProcessor = null;
             try {
-                gifChromaPool = new ChromaWorkerPool();
+                // Honors Settings CPU-only (createChromaProcessor reads as_export_accel).
+                gifChromaProcessor = await createChromaProcessor();
             } catch (poolErr) {
-                console.warn('[export] chroma worker pool unavailable for GIF:', poolErr);
-                gifChromaPool = null;
+                console.warn('[export] chroma processor unavailable for GIF:', poolErr);
+                gifChromaProcessor = null;
             }
             const chromaSettings = this.chromaKey.getSettings();
 
@@ -3217,10 +3550,10 @@ export class ModelExporter {
                 const keyOne = async (f) => {
                     const raw = rawBySource.get(f);
                     if (!raw) return null;
-                    // Copy so worker transfer doesn't detach the stored raw buffer
+                    // Copy so transfer doesn't detach the stored raw buffer
                     const imageData = new ImageData(new Uint8ClampedArray(raw.data), width, height);
-                    if (gifChromaPool) {
-                        return await gifChromaPool.processRgba(imageData, chromaSettings);
+                    if (gifChromaProcessor) {
+                        return await gifChromaProcessor.processRgba(imageData, chromaSettings);
                     }
                     this.chromaKey.processExportFrame(imageData);
                     return imageData;
@@ -3250,9 +3583,9 @@ export class ModelExporter {
                 transparentIndex = globalPalette.length;
                 globalPalette.push([0, 0, 0]);
 
-                // Key remaining frames (bounded concurrency via pool size)
+                // Key remaining frames (bounded concurrency via processor)
                 const remaining = uniqueFrames.filter((f) => !keyedBySource.has(f));
-                const conc = gifChromaPool ? gifChromaPool.size : 1;
+                const conc = gifChromaProcessor ? gifChromaProcessor.concurrency : 1;
                 for (let i = 0; i < remaining.length; i += conc) {
                     if (this._exportCancelled) break;
                     const batch = remaining.slice(i, i + conc);
@@ -3306,9 +3639,9 @@ export class ModelExporter {
                     if ((ui + 1) % 8 === 0) await new Promise(r => setTimeout(r, 0));
                 }
             } finally {
-                if (gifChromaPool) {
-                    gifChromaPool.terminate();
-                    gifChromaPool = null;
+                if (gifChromaProcessor) {
+                    gifChromaProcessor.dispose();
+                    gifChromaProcessor = null;
                 }
             }
 
@@ -3738,6 +4071,7 @@ export class ModelExporter {
 
     /**
      * Seek + draw one source frame. Max 2 attempts; always returns or null quickly.
+     * No frame cache — blank undecoded buffers must never be reused.
      */
     async captureVideoFrameImageData(frameIndex, drawScaled, ctx, width, height) {
         const t = this.frameTimeSeconds(frameIndex);

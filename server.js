@@ -888,12 +888,12 @@ app.post('/api/xai/fetch-url', async (req, res) => {
 });
 
 // ─── Transparent WebM export (ffmpeg) ─────────────────────────────
-// Client chroma-keys frames to PNG (RGBA); server packs them into
+// Client chroma-keys frames (PNG or raw RGBA); server packs them into
 // VP9 WebM with real alpha. Avoids Firefox MediaRecorder alpha bugs.
 //
 // Routes used by model-exporter.engine.ts (Adventurer mode):
-//   POST   /api/export/session
-//   POST   /api/export/session/:id/frame?index=N
+//   POST   /api/export/session              body: { format?: 'png'|'rgba', width?, height? }
+//   POST   /api/export/session/:id/frame?index=N  (PNG or raw RGBA body)
 //   POST   /api/export/session/:id/finalize
 //   DELETE /api/export/session/:id
 //   GET    /api/export/status
@@ -995,13 +995,16 @@ app.get('/api/export/status', async (_req, res) => {
 // --- Local ComfyUI (discovery + template workflows + generation) ---
 comfy.registerRoutes(app);
 
-// ── Session export: stream PNGs to disk as the browser extracts them ──
-// POST   /api/export/session              → { sessionId }
-// POST   /api/export/session/:id/frame?index=N  (body: image/png)
+// ── Session export: stream frames to disk as the browser extracts them ──
+// POST   /api/export/session              → { sessionId, format }
+// POST   /api/export/session/:id/frame?index=N  (PNG or raw RGBA)
 // POST   /api/export/session/:id/finalize → { fps, frameCount } → video/webm
 // DELETE /api/export/session/:id          → cancel / cleanup
 
-/** @type {Map<string, { dir: string, frames: number, created: number }>} */
+/**
+ * @typedef {{ dir: string, frames: number, created: number, format: 'png'|'rgba', width: number, height: number }} ExportSession
+ * @type {Map<string, ExportSession>}
+ */
 const exportSessions = new Map();
 const SESSION_TTL_MS = 60 * 60 * 1000; // 1 hour
 
@@ -1027,7 +1030,12 @@ setInterval(() => {
     }
 }, 5 * 60 * 1000).unref?.();
 
-function encodeWebmFromDir(exportDir, frameCount, fps) {
+function frameFileName(index, format) {
+    const pad = String(index).padStart(5, '0');
+    return format === 'rgba' ? `frame_${pad}.rgba` : `frame_${pad}.png`;
+}
+
+function encodeWebmFromPngDir(exportDir, frameCount, fps) {
     const outPath = path.join(exportDir, 'out.webm');
     const ffmpegPath = resolveFfmpegPath();
     const args = [
@@ -1063,7 +1071,139 @@ function encodeWebmFromDir(exportDir, frameCount, fps) {
     return runFfmpeg(ffmpegPath, args, exportDir).then(() => outPath);
 }
 
-app.post('/api/export/session', async (_req, res) => {
+/**
+ * Raw RGBA frames (no PNG) → VP9+alpha.
+ *
+ * ffmpeg's rawvideo demuxer does NOT support frame_%05d.rgba sequences the way
+ * image2 supports PNGs. Stream concatenated frame files into stdin instead.
+ */
+function encodeWebmFromRgbaDir(exportDir, frameCount, fps, width, height) {
+    const outPath = path.join(exportDir, 'out.webm');
+    const ffmpegPath = resolveFfmpegPath();
+    const expectedBytes = width * height * 4;
+    const args = [
+        '-y',
+        '-hide_banner',
+        '-loglevel',
+        'error',
+        '-f',
+        'rawvideo',
+        '-pixel_format',
+        'rgba',
+        '-video_size',
+        `${width}x${height}`,
+        '-framerate',
+        String(fps),
+        '-i',
+        'pipe:0',
+        '-frames:v',
+        String(frameCount),
+        '-c:v',
+        'libvpx-vp9',
+        '-pix_fmt',
+        'yuva420p',
+        '-auto-alt-ref',
+        '0',
+        '-b:v',
+        '0',
+        '-crf',
+        '28',
+        '-deadline',
+        'good',
+        '-cpu-used',
+        '2',
+        '-an',
+        outPath,
+    ];
+
+    return new Promise((resolve, reject) => {
+        let settled = false;
+        const ok = (v) => {
+            if (settled) return;
+            settled = true;
+            resolve(v);
+        };
+        const fail = (err) => {
+            if (settled) return;
+            settled = true;
+            reject(err instanceof Error ? err : new Error(String(err)));
+        };
+
+        const child = spawn(ffmpegPath, args, {
+            cwd: exportDir,
+            stdio: ['pipe', 'pipe', 'pipe'],
+        });
+        let stderr = '';
+        child.stderr.on('data', (chunk) => {
+            stderr += chunk.toString();
+            if (stderr.length > 20000) stderr = stderr.slice(-12000);
+        });
+        child.on('error', (err) => fail(err));
+        child.on('close', (code) => {
+            if (code === 0) ok(outPath);
+            else fail(new Error(`ffmpeg exited ${code}: ${stderr.slice(-1500)}`));
+        });
+
+        const stdin = child.stdin;
+        let i = 0;
+        const failWrite = (err) => {
+            try {
+                stdin.destroy();
+            } catch (_) {
+                /* ignore */
+            }
+            // Kill ffmpeg so close fires; fail() is idempotent with settled.
+            try {
+                child.kill('SIGTERM');
+            } catch (_) {
+                /* ignore */
+            }
+            fail(err);
+        };
+
+        const pump = () => {
+            if (settled) return;
+            try {
+                while (i < frameCount) {
+                    const name = frameFileName(i, 'rgba');
+                    const p = path.join(exportDir, name);
+                    let buf;
+                    try {
+                        buf = fs.readFileSync(p);
+                    } catch (err) {
+                        failWrite(new Error(`Missing/unreadable ${name}: ${err.message}`));
+                        return;
+                    }
+                    if (buf.length !== expectedBytes) {
+                        failWrite(
+                            new Error(
+                                `${name}: expected ${expectedBytes} bytes, got ${buf.length}`
+                            )
+                        );
+                        return;
+                    }
+                    i++;
+                    if (!stdin.write(buf)) {
+                        stdin.once('drain', pump);
+                        return;
+                    }
+                }
+                stdin.end();
+            } catch (err) {
+                failWrite(err);
+            }
+        };
+
+        pump();
+    });
+}
+
+/** @deprecated name kept for legacy bulk route */
+function encodeWebmFromDir(exportDir, frameCount, fps) {
+    return encodeWebmFromPngDir(exportDir, frameCount, fps);
+}
+
+app.post('/api/export/session', async (req, res) => {
     try {
         const probe = await probeFfmpeg();
         if (!probe.available) {
@@ -1073,20 +1213,46 @@ app.post('/api/export/session', async (_req, res) => {
                 path: probe.path,
             });
         }
+        const format = req.body?.format === 'rgba' ? 'rgba' : 'png';
+        const width = parseInt(req.body?.width, 10) || 0;
+        const height = parseInt(req.body?.height, 10) || 0;
+        if (format === 'rgba' && (width < 1 || height < 1 || width > 8192 || height > 8192)) {
+            return res.status(400).json({
+                error: 'RGBA sessions require valid width/height (1–8192)',
+            });
+        }
         const sessionId = crypto.randomBytes(16).toString('hex');
         const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'as-export-'));
-        exportSessions.set(sessionId, { dir, frames: 0, created: Date.now() });
-        console.log(`  [EXPORT] Session ${sessionId} opened → ${dir}`);
-        res.json({ sessionId, maxFrames: FFMPEG_MAX_FRAMES });
+        exportSessions.set(sessionId, {
+            dir,
+            frames: 0,
+            created: Date.now(),
+            format,
+            width,
+            height,
+        });
+        console.log(
+            `  [EXPORT] Session ${sessionId} opened → ${dir} (${format}${format === 'rgba' ? ` ${width}x${height}` : ''})`
+        );
+        res.json({
+            sessionId,
+            maxFrames: FFMPEG_MAX_FRAMES,
+            format,
+            width: format === 'rgba' ? width : null,
+            height: format === 'rgba' ? height : null,
+        });
     } catch (err) {
         res.status(500).json({ error: err.message || 'Failed to create export session' });
     }
 });
 
-// Raw PNG body — avoids multipart overhead per frame
+// Frame body: PNG or raw RGBA (application/octet-stream)
 app.post(
     '/api/export/session/:id/frame',
-    express.raw({ type: ['image/png', 'application/octet-stream'], limit: '40mb' }),
+    express.raw({
+        type: ['image/png', 'application/octet-stream', 'image/x-rgba'],
+        limit: '80mb',
+    }),
     (req, res) => {
         const session = getExportSession(req.params.id);
         if (!session) {
@@ -1100,16 +1266,27 @@ app.post(
         if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
             return res.status(400).json({ error: 'Empty frame body' });
         }
-        // PNG magic bytes
-        if (req.body.length < 8 || req.body[0] !== 0x89 || req.body[1] !== 0x50) {
-            return res.status(400).json({ error: 'Body is not a PNG image' });
-        }
 
+        const format = session.format || 'png';
         try {
-            const name = `frame_${String(index).padStart(5, '0')}.png`;
+            if (format === 'rgba') {
+                const expected = session.width * session.height * 4;
+                if (req.body.length !== expected) {
+                    return res.status(400).json({
+                        error: `RGBA frame size mismatch: got ${req.body.length}, expected ${expected} (${session.width}x${session.height})`,
+                    });
+                }
+            } else {
+                // PNG magic bytes
+                if (req.body.length < 8 || req.body[0] !== 0x89 || req.body[1] !== 0x50) {
+                    return res.status(400).json({ error: 'Body is not a PNG image' });
+                }
+            }
+
+            const name = frameFileName(index, format);
             fs.writeFileSync(path.join(session.dir, name), req.body);
             session.frames = Math.max(session.frames, index + 1);
-            res.json({ ok: true, index, bytes: req.body.length });
+            res.json({ ok: true, index, bytes: req.body.length, format });
         } catch (err) {
             res.status(500).json({ error: err.message || 'Failed to store frame' });
         }
@@ -1136,9 +1313,10 @@ app.post('/api/export/session/:id/finalize', async (req, res) => {
         return res.status(400).json({ error: `Too many frames (max ${FFMPEG_MAX_FRAMES})` });
     }
 
+    const format = session.format || 'png';
     // Verify sequential frames exist
     for (let i = 0; i < frameCount; i++) {
-        const p = path.join(session.dir, `frame_${String(i).padStart(5, '0')}.png`);
+        const p = path.join(session.dir, frameFileName(i, format));
         if (!fs.existsSync(p)) {
             destroyExportSession(req.params.id);
             return res.status(400).json({ error: `Missing frame ${i} on server` });
@@ -1146,14 +1324,19 @@ app.post('/api/export/session/:id/finalize', async (req, res) => {
     }
 
     const exportDir = session.dir;
+    const width = session.width;
+    const height = session.height;
     // Remove from map so reapers don't double-delete while encoding; we own cleanup now
     exportSessions.delete(req.params.id);
 
     try {
         console.log(
-            `  [EXPORT] Finalize ${req.params.id}: ${frameCount} frames @ ${fps}fps`
+            `  [EXPORT] Finalize ${req.params.id}: ${frameCount} frames @ ${fps}fps (${format})`
         );
-        const outPath = await encodeWebmFromDir(exportDir, frameCount, fps);
+        const outPath =
+            format === 'rgba'
+                ? await encodeWebmFromRgbaDir(exportDir, frameCount, fps, width, height)
+                : await encodeWebmFromPngDir(exportDir, frameCount, fps);
 
         if (!fs.existsSync(outPath) || fs.statSync(outPath).size === 0) {
             throw new Error('ffmpeg produced an empty output file');

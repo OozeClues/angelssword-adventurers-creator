@@ -1,4 +1,5 @@
-import { Component, computed, inject, signal } from '@angular/core';
+import { Component, computed, inject, OnInit, signal } from '@angular/core';
+import { DecimalPipe } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { SettingsService } from '../../core/settings.service';
 import { ToastService } from '../../core/toast.service';
@@ -9,10 +10,14 @@ import {
 } from '../../core/xai-oauth.service';
 import type { XaiBackend } from '../../core/gen-providers';
 import { UploadZoneComponent } from '../../shared/components/upload-zone.component';
+import {
+  probeExportAcceleration,
+  type ExportAccelProbe,
+} from '../exporter/chroma-backend';
 
 @Component({
   selector: 'app-settings',
-  imports: [FormsModule, UploadZoneComponent],
+  imports: [FormsModule, UploadZoneComponent, DecimalPipe],
   template: `
     <div class="settings-section settings-two-col">
       <div class="settings-col settings-col-left">
@@ -115,6 +120,137 @@ import { UploadZoneComponent } from '../../shared/components/upload-zone.compone
             <a href="https://www.angelssword.com" target="_blank" rel="noopener">angelssword.com</a>
             <a href="https://rpg.angelssword.com" target="_blank" rel="noopener">rpg.angelssword.com</a>
             <a href="https://clio.angelssword.com" target="_blank" rel="noopener">clio.angelssword.com</a>
+          </div>
+        </div>
+      </div>
+
+      <div class="glass-panel">
+        <div class="panel-title">
+          <span class="title-icon">⚡</span> Export acceleration
+          @if (!accelChecking()) {
+            <button
+              type="button"
+              class="btn btn-sm btn-secondary accel-refresh-btn"
+              title="Re-check WebGPU / CPU chroma backend"
+              (click)="refreshAccel()"
+            >
+              ↻ Re-check
+            </button>
+          }
+        </div>
+        <div class="panel-subtitle">
+          <strong>Preview</strong> keys at half-res while scrubbing/playing (thumbnails cached), then
+          full-res on settle. <strong>Export (auto)</strong> uses WebGPU keying + raw RGBA frames when
+          available (skips PNG compress); otherwise CPU workers + PNG. Transparent WebM is always packed
+          with <strong>ffmpeg VP9+alpha</strong>.
+        </div>
+
+        <div class="form-row mt-1">
+          <label>Chroma acceleration</label>
+          <div class="mode-selector" role="group" aria-label="Export chroma acceleration">
+            <button
+              type="button"
+              class="mode-btn"
+              [class.active]="settings.exportAccelMode() === 'auto'"
+              title="Use WebGPU when available for export keying and raw frames"
+              (click)="setExportAccel('auto')"
+            >
+              Auto (WebGPU)
+            </button>
+            <button
+              type="button"
+              class="mode-btn"
+              [class.active]="settings.exportAccelMode() === 'cpu'"
+              title="Force multi-core CPU workers + PNG only (safe fallback)"
+              (click)="setExportAccel('cpu')"
+            >
+              CPU only
+            </button>
+          </div>
+          <div class="text-dim mt-1" style="font-size: 0.75rem">
+            Choose <strong>CPU only</strong> if GPU keying glitches, crashes, or is slower on your drivers.
+            Preview still falls back to CPU automatically when WebGPU is missing.
+          </div>
+        </div>
+
+        <div
+          class="accel-badge accel-badge-panel"
+          [class.accel-webgpu]="accel()?.backend === 'webgpu'"
+          [class.accel-cpu]="accel()?.backend === 'cpu'"
+          [class.accel-checking]="accelChecking()"
+          role="status"
+          aria-live="polite"
+        >
+          <span class="accel-icon" aria-hidden="true">
+            @if (accelChecking()) {
+              ⏳
+            } @else if (accel()?.backend === 'webgpu') {
+              ⚡
+            } @else {
+              🖥️
+            }
+          </span>
+          <div class="accel-text">
+            <div class="accel-title-row">
+              <span class="accel-label">Export chroma</span>
+              <span class="accel-pill">
+                @if (accelChecking()) {
+                  Checking…
+                } @else {
+                  {{ accel()!.label }}
+                }
+              </span>
+              @if (accel()?.stage && !accelChecking()) {
+                <span class="accel-stage">stage: {{ accel()!.stage }}</span>
+              }
+            </div>
+            <div class="accel-summary">
+              @if (accelChecking()) {
+                Probing WebGPU (API → adapter → device → shaders → smoke)…
+              } @else if (accel()?.backend === 'webgpu') {
+                {{ accel()!.summary }}
+                @if (accelAdapterLine()) {
+                  <span class="accel-adapter"> · {{ accelAdapterLine() }}</span>
+                }
+              } @else {
+                {{ accel()!.summary }}
+              }
+            </div>
+            @if (accel() && !accelChecking()) {
+              <div class="accel-detail">{{ accel()!.detail }}</div>
+              @if (accel()?.reason) {
+                <div class="accel-fail-reason">
+                  <strong>Why not WebGPU:</strong> {{ accel()!.reason }}
+                </div>
+              }
+              <ul class="accel-diag">
+                <li>
+                  <span class="diag-k">navigator.gpu</span>
+                  <span class="diag-v" [class.diag-ok]="accel()!.apiPresent" [class.diag-bad]="accel()!.apiPresent === false">
+                    {{ accel()!.apiPresent ? 'present' : 'missing' }}
+                  </span>
+                </li>
+                <li>
+                  <span class="diag-k">Adapter</span>
+                  <span class="diag-v" [class.diag-ok]="!!accelAdapterLine()" [class.diag-bad]="!accelAdapterLine()">
+                    {{ accelAdapterLine() || 'none' }}
+                  </span>
+                </li>
+                <li>
+                  <span class="diag-k">Init stage</span>
+                  <span class="diag-v">{{ accel()!.stage || '—' }}</span>
+                </li>
+                @if (accel()!.parityMaxDelta != null) {
+                  <li>
+                    <span class="diag-k">Smoke vs CPU</span>
+                    <span class="diag-v">
+                      max |Δ|={{ accel()!.parityMaxDelta }},
+                      {{ (accel()!.parityMismatchPct ?? 0) | number: '1.1-1' }}% pixels
+                    </span>
+                  </li>
+                }
+              </ul>
+            }
           </div>
         </div>
       </div>
@@ -826,6 +962,134 @@ import { UploadZoneComponent } from '../../shared/components/upload-zone.compone
   `,
   styles: [
     `
+      .accel-refresh-btn {
+        margin-left: auto;
+        font-size: 0.72rem;
+      }
+      .panel-title {
+        display: flex;
+        align-items: center;
+        gap: 0.4rem;
+        flex-wrap: wrap;
+      }
+      .accel-badge {
+        display: flex;
+        align-items: flex-start;
+        gap: 0.75rem;
+        text-align: left;
+        margin-top: 0.75rem;
+        padding: 0.85rem 0.95rem;
+        border-radius: 10px;
+        border: 1px solid var(--border, rgba(255, 255, 255, 0.1));
+        background: rgba(0, 0, 0, 0.22);
+      }
+      .accel-badge.accel-webgpu {
+        border-color: rgba(94, 210, 168, 0.45);
+        box-shadow: 0 0 0 1px rgba(94, 210, 168, 0.12);
+      }
+      .accel-badge.accel-cpu {
+        border-color: rgba(255, 255, 255, 0.1);
+      }
+      .accel-badge.accel-checking {
+        opacity: 0.9;
+      }
+      .accel-icon {
+        font-size: 1.45rem;
+        line-height: 1.3;
+        flex-shrink: 0;
+      }
+      .accel-text {
+        flex: 1;
+        min-width: 0;
+      }
+      .accel-title-row {
+        display: flex;
+        align-items: center;
+        gap: 0.45rem;
+        flex-wrap: wrap;
+        margin-bottom: 0.25rem;
+      }
+      .accel-label {
+        font-size: 0.72rem;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        color: var(--text-dim, #9aa3b5);
+      }
+      .accel-pill {
+        font-family: var(--font-mono, ui-monospace, monospace);
+        font-size: 0.7rem;
+        font-weight: 600;
+        padding: 0.12rem 0.5rem;
+        border-radius: 999px;
+        border: 1px solid var(--border, rgba(255, 255, 255, 0.12));
+        color: var(--text, #e0e0e0);
+      }
+      .accel-webgpu .accel-pill {
+        color: #7eecc0;
+        border-color: rgba(94, 210, 168, 0.5);
+        background: rgba(94, 210, 168, 0.1);
+      }
+      .accel-cpu .accel-pill {
+        color: #c5cde0;
+        background: rgba(255, 255, 255, 0.04);
+      }
+      .accel-stage {
+        font-family: var(--font-mono, ui-monospace, monospace);
+        font-size: 0.65rem;
+        color: var(--text-dim, #9aa3b5);
+      }
+      .accel-summary {
+        font-size: 0.82rem;
+        color: var(--text, #e0e0e0);
+        line-height: 1.35;
+      }
+      .accel-adapter {
+        color: var(--accent-gold, #dbb858);
+      }
+      .accel-detail {
+        margin-top: 0.4rem;
+        font-size: 0.72rem;
+        line-height: 1.45;
+        color: var(--text-dim, #9aa3b5);
+      }
+      .accel-fail-reason {
+        margin-top: 0.45rem;
+        font-size: 0.72rem;
+        line-height: 1.4;
+        color: #f0b4b4;
+        padding: 0.4rem 0.5rem;
+        border-radius: 6px;
+        background: rgba(220, 80, 80, 0.12);
+        border: 1px solid rgba(220, 80, 80, 0.25);
+      }
+      .accel-diag {
+        list-style: none;
+        margin: 0.55rem 0 0;
+        padding: 0;
+        display: grid;
+        gap: 0.25rem;
+      }
+      .accel-diag li {
+        display: flex;
+        gap: 0.5rem;
+        font-size: 0.7rem;
+        flex-wrap: wrap;
+      }
+      .diag-k {
+        min-width: 5.5rem;
+        color: var(--text-dim, #9aa3b5);
+        font-family: var(--font-mono, ui-monospace, monospace);
+      }
+      .diag-v {
+        color: var(--text, #e0e0e0);
+        word-break: break-word;
+      }
+      .diag-ok {
+        color: #7eecc0;
+      }
+      .diag-bad {
+        color: #f0b4b4;
+      }
       .xai-backend-inactive {
         opacity: 0.72;
       }
@@ -908,7 +1172,7 @@ import { UploadZoneComponent } from '../../shared/components/upload-zone.compone
     `,
   ],
 })
-export class SettingsComponent {
+export class SettingsComponent implements OnInit {
   readonly settings = inject(SettingsService);
   readonly toast = inject(ToastService);
   readonly sound = inject(NotificationSoundService);
@@ -936,6 +1200,15 @@ export class SettingsComponent {
   readonly oauthVerifyUrl = signal('');
   readonly oauthStatusMsg = signal<{ type: string; text: string } | null>(null);
 
+  /** Export chroma acceleration (WebGPU vs CPU) for the About card. */
+  readonly accel = signal<ExportAccelProbe | null>(null);
+  readonly accelChecking = signal(true);
+  readonly accelAdapterLine = computed(() => {
+    const a = this.accel();
+    if (!a) return '';
+    return [a.vendor, a.adapterName].filter(Boolean).join(' · ');
+  });
+
   private loginAbort: AbortController | null = null;
 
   readonly oauthStatus = computed(() => this.oauth.getStatus());
@@ -953,12 +1226,60 @@ export class SettingsComponent {
     }
   }
 
+  ngOnInit(): void {
+    void this.loadAccel(false);
+  }
+
+  async refreshAccel(): Promise<void> {
+    await this.loadAccel(true);
+    const a = this.accel();
+    if (a) {
+      this.toast.show(
+        a.backend === 'webgpu'
+          ? `Export chroma: WebGPU${this.accelAdapterLine() ? ` (${this.accelAdapterLine()})` : ''}`
+          : `Export chroma: CPU — ${a.reason || 'WebGPU unavailable'}`,
+        a.backend === 'webgpu' ? 'success' : 'info'
+      );
+    }
+  }
+
+  private async loadAccel(force: boolean): Promise<void> {
+    this.accelChecking.set(true);
+    try {
+      const result = await probeExportAcceleration({ force });
+      this.accel.set(result);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.accel.set({
+        backend: 'cpu',
+        label: 'CPU',
+        summary: 'CPU workers',
+        detail: 'Could not probe acceleration; export will use CPU workers.',
+        reason: msg,
+      });
+    } finally {
+      this.accelChecking.set(false);
+    }
+  }
+
   setXaiBackend(backend: XaiBackend): void {
     this.settings.setXaiBackend(backend);
     this.toast.show(
       `Grok backend: ${backend === 'oauth' ? 'SuperGrok OAuth' : 'API Key'}`,
       'info'
     );
+  }
+
+  setExportAccel(mode: 'auto' | 'cpu'): void {
+    this.settings.setExportAccelMode(mode);
+    this.toast.show(
+      mode === 'cpu'
+        ? 'WebGPU disabled — export & preview use CPU only'
+        : 'Auto mode — WebGPU used when available',
+      mode === 'cpu' ? 'warning' : 'info'
+    );
+    // Re-probe so the badge reflects the user's choice immediately.
+    void this.loadAccel(true);
   }
 
   saveOpenAI(): void {

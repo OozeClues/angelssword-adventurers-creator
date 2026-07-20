@@ -30,6 +30,15 @@ const COMFY_IMAGE_FREE_KEY = 'as_comfy_image_free_before';
 const COMFY_VIDEO_FREE_KEY = 'as_comfy_video_free_before';
 const COMFY_IMAGE_BIND_KEY = 'as_comfy_image_bindings';
 const COMFY_VIDEO_BIND_KEY = 'as_comfy_video_bindings';
+/** Export chroma acceleration: auto (WebGPU when available) or force CPU workers. */
+const EXPORT_ACCEL_KEY = 'as_export_accel';
+
+export type ExportAccelMode = 'auto' | 'cpu';
+
+function loadExportAccelMode(): ExportAccelMode {
+  const raw = localStorage.getItem(EXPORT_ACCEL_KEY);
+  return raw === 'cpu' ? 'cpu' : 'auto';
+}
 
 function loadXaiBackend(): XaiBackend {
   const raw = localStorage.getItem(XAI_BACKEND_KEY);
@@ -209,6 +218,12 @@ export class SettingsService {
   readonly googleKey = signal(localStorage.getItem('google_api_key') ?? '');
   readonly xaiKey = signal(localStorage.getItem('xai_api_key') ?? '');
   readonly soundEnabled = signal(localStorage.getItem('as_sound_enabled') !== 'false');
+
+  /**
+   * Export chroma path: `auto` uses WebGPU when available (raw RGBA + GPU key),
+   * `cpu` forces multi-core workers + PNG (safe fallback for bad drivers).
+   */
+  readonly exportAccelMode = signal<ExportAccelMode>(loadExportAccelMode());
 
   /**
    * Master toggle: which Grok credential path is used for Imagine image/video.
@@ -1479,6 +1494,20 @@ export class SettingsService {
   setSoundEnabled(enabled: boolean): void {
     this.soundEnabled.set(enabled);
     localStorage.setItem('as_sound_enabled', String(enabled));
+  }
+
+  setExportAccelMode(mode: ExportAccelMode): void {
+    const m: ExportAccelMode = mode === 'cpu' ? 'cpu' : 'auto';
+    this.exportAccelMode.set(m);
+    localStorage.setItem(EXPORT_ACCEL_KEY, m);
+    // Tear down any warm WebGPU session when forcing CPU-only.
+    if (m === 'cpu') {
+      void import('../features/exporter/chroma-webgpu')
+        .then((mod) => mod.disposeSharedPreviewWebGpu())
+        .catch(() => {
+          /* module may not be loaded */
+        });
+    }
   }
 
   /**
