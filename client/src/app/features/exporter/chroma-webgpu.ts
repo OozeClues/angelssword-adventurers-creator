@@ -1364,15 +1364,30 @@ let sharedPreviewGpuPromise: Promise<WebGpuChromaProcessor | null> | null = null
  * Get or create a shared WebGPU chroma processor for scrub/preview.
  * Returns null when WebGPU is unavailable — caller should use CPU ChromaKey.
  */
-export async function getSharedPreviewWebGpu(): Promise<WebGpuChromaProcessor | null> {
-  // Settings → CPU only: never create or return a WebGPU session.
+function isPreviewCpuOnlySetting(): boolean {
   try {
-    if (typeof localStorage !== 'undefined' && localStorage.getItem('as_export_accel') === 'cpu') {
-      disposeSharedPreviewWebGpu();
-      return null;
-    }
+    if (typeof localStorage === 'undefined') return false;
+    const p = localStorage.getItem('as_preview_accel');
+    if (p === 'cpu') return true;
+    if (p === 'auto') return false;
+    return localStorage.getItem('as_export_accel') === 'cpu';
   } catch {
-    /* ignore */
+    return false;
+  }
+}
+
+export type GetSharedPreviewOpts = {
+  /** When true, allow GPU even if Preview mode is CPU (used for Export mode=GPU). */
+  allowForExport?: boolean;
+};
+
+export async function getSharedPreviewWebGpu(
+  opts: GetSharedPreviewOpts = {}
+): Promise<WebGpuChromaProcessor | null> {
+  // Settings → Preview CPU only: block unless export explicitly needs GPU.
+  if (!opts.allowForExport && isPreviewCpuOnlySetting()) {
+    disposeSharedPreviewWebGpu();
+    return null;
   }
 
   if (sharedPreviewGpu?.isUsable) {
@@ -1382,19 +1397,10 @@ export async function getSharedPreviewWebGpu(): Promise<WebGpuChromaProcessor | 
 
   sharedPreviewGpuPromise = (async () => {
     try {
-      // Re-check inside async (user may have flipped to CPU only while we waited).
-      try {
-        if (
-          typeof localStorage !== 'undefined' &&
-          localStorage.getItem('as_export_accel') === 'cpu'
-        ) {
-          return null;
-        }
-      } catch {
-        /* ignore */
+      if (!opts.allowForExport && isPreviewCpuOnlySetting()) {
+        return null;
       }
 
-      // Dispose a dead session first
       if (sharedPreviewGpu) {
         try {
           sharedPreviewGpu.dispose();
@@ -1408,17 +1414,9 @@ export async function getSharedPreviewWebGpu(): Promise<WebGpuChromaProcessor | 
         console.info('[chroma-webgpu] preview GPU unavailable:', report.message);
         return null;
       }
-      // Final gate after slow device init
-      try {
-        if (
-          typeof localStorage !== 'undefined' &&
-          localStorage.getItem('as_export_accel') === 'cpu'
-        ) {
-          report.processor.dispose();
-          return null;
-        }
-      } catch {
-        /* ignore */
+      if (!opts.allowForExport && isPreviewCpuOnlySetting()) {
+        report.processor.dispose();
+        return null;
       }
       sharedPreviewGpu = report.processor;
       console.info('[chroma-webgpu] preview GPU ready');

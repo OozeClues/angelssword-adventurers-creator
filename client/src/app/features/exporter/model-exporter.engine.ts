@@ -1,7 +1,7 @@
 // @ts-nocheck
 /* eslint-disable */
 // Ported from legacy/public/model-exporter.js — UI wiring uses __hooks injected at runtime.
-import { ChromaKey } from './chroma-key';
+import { ChromaKey, normalizeChromaKeySettings } from './chroma-key';
 export { ChromaKey };
 import {
   createChromaProcessor,
@@ -19,6 +19,28 @@ export type ExporterHooks = {
   /** Shared pipeline key color (Sprite Prep / Exporter / handoffs). */
   getKeyColor?: () => string;
   setKeyColor?: (hex: string) => void;
+  /** Shared Video Prep 1/N unkeyed scrub bank (optional). */
+  getScrubProxy?: () => {
+    key: string;
+    totalFrames: number;
+    videoWidth: number;
+    videoHeight: number;
+    scale: number;
+    pw: number;
+    ph: number;
+    frames: (HTMLCanvasElement | null)[];
+  } | null;
+  /** Publish exporter-built proxies so a later Video Prep visit can reuse. */
+  setScrubProxy?: (bank: {
+    key: string;
+    totalFrames: number;
+    videoWidth: number;
+    videoHeight: number;
+    scale: number;
+    pw: number;
+    ph: number;
+    frames: (HTMLCanvasElement | null)[];
+  } | null) => void;
   ASAdventurer: any;
   notificationSound: { play: () => void } | null;
 };
@@ -736,7 +758,15 @@ export class ModelExporter {
         this.fps = 30;
         this.duration = 0;
         this.totalFrames = 0;
+        /** Source frame index currently shown (for seek / key cache). */
         this.currentFrame = 0;
+        /**
+         * Position on the *export* timeline (0 … exportFrameCount-1).
+         * Scrubber / play walk this index; reverse & ping-pong reorder the list under it.
+         */
+        this.previewIndex = 0;
+        /** Ordered source frames matching export (skip + reverse + ping-pong). */
+        this._previewSourceList = [];
         this.isPlaying = false;
         this.playTimer = null;
 
@@ -747,22 +777,37 @@ export class ModelExporter {
         this.workCtx = null;
 
         // WebGPU interactive preview (null=untried, false=unavailable, processor=ready)
+        // Used only for *settled* full-res keying when Preview Mode = Auto — not while dragging.
         this._previewGpu = null;
         this._previewGpuReady = false;
         this._previewGen = 0;
         this._keyPreviewTimer = null;
         this._keyPreviewFullTimer = null;
-        /** Half-res canvas for fast GPU scrub (created lazily). */
+        /** Offscreen canvas for lo-res putImageData / upscale blit. */
         this._previewLoCanvas = null;
         this._previewLoCtx = null;
-        /** Fraction of full resolution used while scrubbing / playing. */
-        this._previewScrubScale = 0.5;
         /**
-         * Low-res *keyed* scrub thumbnails only (frame index → ImageData at half-res).
-         * Full-res is never cached — settle always seeks + processes live.
+         * Scrub proxy scale (4 = 1/4 resolution unkeyed). Matches Video Prep default.
+         * During scrub/play we only show these — no chroma, no full-res unkeyed flash.
          */
-        this._scrubLoCache = new Map();
-        this._scrubLoCacheMax = 48;
+        this._scrubProxyScale = 4;
+        /** Source-frame index → unkeyed proxy canvas (1/N). Shared with Video Prep when possible. */
+        this._scrubProxyFrames = null;
+        this._scrubProxyPw = 0;
+        this._scrubProxyPh = 0;
+        this._scrubProxyKey = '';
+        /** Blob size of the currently loaded clip (for proxy bank identity). */
+        this._videoBlobSize = 0;
+        /** Bumps on each new load so in-flight proxy builds abort. */
+        this._scrubProxyBuildGen = 0;
+        /** True until the 1/N scrub bank is complete (or adopted from Video Prep). */
+        this._scrubProxyReady = false;
+        /** True while the blocking proxy-build overlay is shown. */
+        this._scrubProxyCaching = false;
+        /** True while the user is dragging the scrubber (proxy-only path). */
+        this._scrubbing = false;
+        /** Monotonic token so in-flight settle seeks don't paint after a newer scrub. */
+        this._seekSeq = 0;
 
         // Scale/offset
         this.videoScale = 1;
@@ -861,7 +906,8 @@ export class ModelExporter {
 
         this.chromaKey.setKeyColor(rgb.r, rgb.g, rgb.b);
         this._selectSwatch(h);
-        this._scrubLoCache?.clear();
+        // Unkeyed scrub proxies stay valid — only re-key the settled frame.
+        this._cancelKeyPreviewTimers?.();
 
         if (opts.persist !== false && typeof __hooks.setKeyColor === 'function') {
             __hooks.setKeyColor(h);
@@ -1039,6 +1085,7 @@ export class ModelExporter {
             this.totalFrames = 1;
         }
         this.currentFrame = 0;
+        this.previewIndex = 0;
 
         this.previewCanvas.width = this.videoWidth;
         this.previewCanvas.height = this.videoHeight;
@@ -1055,21 +1102,17 @@ export class ModelExporter {
             endFrame = Math.min(lastFrame, Math.max(0, Math.round(meta.loopPoint)));
         }
 
-        const scrubber = document.getElementById('exScrubber');
-        if (scrubber) {
-            scrubber.max = lastFrame;
-            scrubber.value = 0;
-        }
-
         const startEl = document.getElementById('exStartFrame');
         const endEl = document.getElementById('exEndFrame');
         if (startEl) {
             startEl.value = 0;
             startEl.max = lastFrame;
+            startEl.min = 0;
         }
         if (endEl) {
             endEl.value = endFrame;
             endEl.max = lastFrame;
+            endEl.min = 0;
         }
 
         const wEl = document.getElementById('exWidth');
@@ -1080,7 +1123,8 @@ export class ModelExporter {
         this.videoLoaded = true;
         // Apply keep-speed FPS from source + current skip
         this.syncExportFpsFromSkip();
-        this.updateFrameInfo();
+        // Scrubber spans the export timeline only (start–end + skip + reverse/ping-pong)
+        this.syncPreviewTimeline({ seek: false });
         this.updateVideoInfo();
         this.updateSizeEstimate();
         this.updateExportValidation();
@@ -1108,15 +1152,15 @@ export class ModelExporter {
             this.totalFrames = Math.max(1, Math.round(meta.totalFrames));
             const lastFrame = Math.max(0, this.totalFrames - 1);
             const endEl = document.getElementById('exEndFrame');
-            const scrubber = document.getElementById('exScrubber');
+            const startEl = document.getElementById('exStartFrame');
+            if (startEl) startEl.max = lastFrame;
             if (endEl) {
                 endEl.max = lastFrame;
                 if (typeof meta.loopPoint !== 'number' || meta.loopPoint < 2) {
                     endEl.value = lastFrame;
                 }
             }
-            if (scrubber) scrubber.max = lastFrame;
-            this.updateFrameInfo();
+            this.syncPreviewTimeline({ seek: false });
             this.updateVideoInfo();
             this.updateSizeEstimate();
             this.syncExportFpsFromSkip();
@@ -1155,7 +1199,15 @@ export class ModelExporter {
         // user keeps the same keying look for the same character.
         this.loadPersistedSliders();
 
-        this.updatePreview();
+        // Bind proxy bank to *this* clip, then build scrub proxies with spinner
+        // (same UX as Video Prep) so scrubbing only starts when the bank is clean.
+        this._resetScrubProxiesForCurrentVideo();
+        this._setScrubProxyReady(false);
+        await this._buildScrubProxyCache(this._scrubProxyBuildGen);
+
+        this._paintScrubProxy(this.currentFrame);
+        this.seekToFrame(this.currentFrame, { quality: 'full' });
+
         const outEst = this.getOutputFrameCount();
         __hooks.showToast(
             `Video loaded: ${this.videoWidth}×${this.videoHeight}, ${this.totalFrames} frames @ ${this.fps}fps` +
@@ -1169,7 +1221,18 @@ export class ModelExporter {
         // when the user uploads a file directly.
         this._pendingVideoMeta = meta || null;
         this.detectedFps = meta?.fps ? Number(meta.fps) : null;
-        this._scrubLoCache?.clear();
+        this._videoBlobSize =
+            fileOrBlob && typeof fileOrBlob.size === 'number' ? fileOrBlob.size : 0;
+        this._scrubProxyBuildGen = (this._scrubProxyBuildGen | 0) + 1;
+        this._clearLocalScrubProxy();
+        this._setScrubProxyReady(false);
+        this._setScrubProxyCachingUi(
+            true,
+            'Loading video…',
+            'Scrub preview will build after metadata is ready'
+        );
+        // Shared pipeline bank is dropped in _resetScrubProxiesForCurrentVideo when
+        // the identity key no longer matches (keeps Video Prep bank on same-clip handoff).
 
         if (this._videoObjectUrl) {
             try {
@@ -1196,6 +1259,27 @@ export class ModelExporter {
     loadVideoFromUrl(url, meta) {
         this._pendingVideoMeta = meta || null;
         this.detectedFps = meta?.fps ? Number(meta.fps) : null;
+        // Prefer blob size from handoff when available
+        let blobSize = 0;
+        try {
+            const b =
+                meta?.blob ||
+                __hooks.ASAdventurer?.handoff?.videoPrepData?.blob ||
+                __hooks.ASAdventurer?.handoff?.videoBlob;
+            if (b && typeof b.size === 'number') blobSize = b.size;
+        } catch {
+            /* ignore */
+        }
+        this._videoBlobSize = blobSize;
+        this._scrubProxyBuildGen = (this._scrubProxyBuildGen | 0) + 1;
+        this._clearLocalScrubProxy();
+        this._setScrubProxyReady(false);
+        this._setScrubProxyCachingUi(
+            true,
+            'Loading video…',
+            'Scrub preview will build after metadata is ready'
+        );
+
         this.video.src = url;
 
         this.video.addEventListener(
@@ -1452,8 +1536,8 @@ export class ModelExporter {
     bindSliders() {
         const debounced = __hooks.debounce(() => this.updatePreview({ quality: 'full' }), 150);
         const onKeyParam = () => {
-            // Keyed lo-res thumbs are invalid when key params change.
-            this._scrubLoCache?.clear();
+            // Unkeyed 1/4 proxies are independent of chroma settings — keep them.
+            this._cancelKeyPreviewTimers();
             this.persistSliders();
             debounced();
         };
@@ -1487,9 +1571,10 @@ export class ModelExporter {
         scaleSlider.addEventListener('input', () => {
             document.getElementById('exScaleVal').textContent = scaleSlider.value + '%';
             this.videoScale = parseInt(scaleSlider.value) / 100;
-            this._scrubLoCache?.clear();
+            // Proxies are full-frame crops; scale is applied at paint time.
             this.persistSliders();
-            debounced();
+            if (this._scrubbing || this.isPlaying) this._paintScrubProxy(this.currentFrame);
+            else debounced();
         });
 
         // Vertical Offset
@@ -1497,9 +1582,9 @@ export class ModelExporter {
         vOffsetSlider.addEventListener('input', () => {
             document.getElementById('exVOffsetVal').textContent = vOffsetSlider.value + 'px';
             this.videoOffset = parseInt(vOffsetSlider.value);
-            this._scrubLoCache?.clear();
             this.persistSliders();
-            debounced();
+            if (this._scrubbing || this.isPlaying) this._paintScrubProxy(this.currentFrame);
+            else debounced();
         });
 
         // Saturation
@@ -1711,24 +1796,27 @@ export class ModelExporter {
             if (!eng) return;
 
             const ck = this.chromaKey;
-            if (eng.similarity != null) ck.similarity = this._clampNum(eng.similarity, 0, 1, 0.4);
-            if (eng.smoothness != null) ck.smoothness = this._clampNum(eng.smoothness, 0, 1, 0.08);
-            if (eng.spillSuppression != null) {
-                ck.spillSuppression = this._clampNum(eng.spillSuppression, 0, 1, 0.1);
-            }
-            if (eng.postSaturation != null) {
-                ck.postSaturation = this._clampNum(eng.postSaturation, 0, 2, 1);
-            }
-            if (eng.postBrightness != null) {
-                ck.postBrightness = this._clampNum(eng.postBrightness, 0.5, 1.5, 1);
-            }
-            if (eng.edgeFadeWidth != null) {
-                ck.edgeFadeWidth = Math.max(0, Math.min(200, parseInt(eng.edgeFadeWidth, 10) || 0));
-            }
-            if (eng.antiAlias != null) ck.antiAlias = !!eng.antiAlias;
-            if (eng.smokeCleanup != null) ck.smokeCleanup = !!eng.smokeCleanup;
+            // Use shared normalizer so accidental percent storage (similarity: 45)
+            // becomes 0.45 — never clamp 45 → 1.0 which over-keys everything.
+            ck.applySettings({
+                similarity: eng.similarity,
+                smoothness: eng.smoothness,
+                spillSuppression: eng.spillSuppression,
+                postSaturation: eng.postSaturation,
+                postBrightness: eng.postBrightness,
+                edgeFadeWidth: eng.edgeFadeWidth,
+                antiAlias: eng.antiAlias,
+                smokeCleanup: eng.smokeCleanup,
+            });
             if (eng.videoScale != null) {
-                this.videoScale = this._clampNum(eng.videoScale, 0.1, 3, 1);
+                // Scale may be unit (1.0) or percent (100)
+                const s = Number(eng.videoScale);
+                this.videoScale = this._clampNum(
+                    Number.isFinite(s) && s > 3 ? s / 100 : s,
+                    0.1,
+                    3,
+                    1
+                );
             }
             if (eng.videoOffset != null) {
                 this.videoOffset = parseInt(eng.videoOffset, 10) || 0;
@@ -1786,6 +1874,94 @@ export class ModelExporter {
         if (smokeToggle) smokeToggle.checked = !!ck.smokeCleanup;
     }
 
+    /**
+     * Collect chroma settings for export. DOM sliders are the source of truth for
+     * what the user sees (e.g. "45%"); engine holds key color + any non-UI fields.
+     * Always returns a fully normalized unit-scale object (similarity 0–1, not %).
+     */
+    _collectChromaSettingsForExport() {
+        const ck = this.chromaKey;
+        const engine = ck.getSettings();
+
+        const pct = (id, fallbackUnit) => {
+            const el = document.getElementById(id);
+            if (!el || el.value === '' || el.value == null) return fallbackUnit;
+            const n = Number(el.value);
+            if (!Number.isFinite(n)) return fallbackUnit;
+            // Range inputs are percent (0–100/200); convert to unit scale
+            return n / 100;
+        };
+        const px = (id, fallback) => {
+            const el = document.getElementById(id);
+            if (!el || el.value === '' || el.value == null) return fallback;
+            const n = parseInt(el.value, 10);
+            return Number.isFinite(n) ? n : fallback;
+        };
+        const checked = (id, fallback) => {
+            const el = document.getElementById(id);
+            if (!el || el.type !== 'checkbox') return fallback;
+            return !!el.checked;
+        };
+
+        const raw = {
+            keyR: engine.keyR,
+            keyG: engine.keyG,
+            keyB: engine.keyB,
+            similarity: pct('exSimilarity', engine.similarity),
+            smoothness: pct('exSmoothness', engine.smoothness),
+            spillSuppression: pct('exSpillSuppress', engine.spillSuppression),
+            postSaturation: pct('exSaturation', engine.postSaturation),
+            postBrightness: pct('exBrightness', engine.postBrightness),
+            edgeFadeWidth: px('exEdgeFade', engine.edgeFadeWidth | 0),
+            antiAlias: checked('exAntiAlias', !!engine.antiAlias),
+            smokeCleanup: checked('exSmokeCleanup', !!engine.smokeCleanup),
+        };
+
+        const normalized = normalizeChromaKeySettings(raw);
+
+        // Keep engine aligned with what we export (preview + export stay in lockstep)
+        ck.applySettings(normalized);
+
+        // Detect engine↔DOM drift so we can spot transfer bugs in the console
+        const drift = [];
+        for (const k of [
+            'similarity',
+            'smoothness',
+            'spillSuppression',
+            'postSaturation',
+            'postBrightness',
+            'edgeFadeWidth',
+            'antiAlias',
+            'smokeCleanup',
+        ]) {
+            const a = engine[k];
+            const b = normalized[k];
+            if (typeof a === 'number' && typeof b === 'number') {
+                if (Math.abs(a - b) > 1e-6) drift.push(`${k}: engine=${a} → export=${b}`);
+            } else if (a !== b) {
+                drift.push(`${k}: engine=${a} → export=${b}`);
+            }
+        }
+        if (drift.length) {
+            console.warn('[export] chroma engine/DOM drift corrected:', drift.join(', '));
+        }
+        console.log(
+            '[export] chroma settings →',
+            `sim=${(normalized.similarity * 100).toFixed(1)}%`,
+            `smooth=${(normalized.smoothness * 100).toFixed(1)}%`,
+            `spill=${(normalized.spillSuppression * 100).toFixed(1)}%`,
+            `key=rgb(${normalized.keyR},${normalized.keyG},${normalized.keyB})`,
+            `aa=${normalized.antiAlias}`,
+            `smoke=${normalized.smokeCleanup}`,
+            `fade=${normalized.edgeFadeWidth}`,
+            `sat=${(normalized.postSaturation * 100).toFixed(0)}%`,
+            `bri=${(normalized.postBrightness * 100).toFixed(0)}%`,
+            normalized
+        );
+
+        return normalized;
+    }
+
     // ─── PREVIEW MODES ───
     bindPreviewModes() {
         const container = document.getElementById('exPreviewModes');
@@ -1823,6 +1999,7 @@ export class ModelExporter {
         const nextBtn = document.getElementById('exNextFrame');
 
         playBtn.addEventListener('click', () => {
+            if (this._scrubProxyCaching || !this._scrubProxyReady) return;
             if (this.isPlaying) {
                 this.stopPlayback();
             } else {
@@ -1831,141 +2008,816 @@ export class ModelExporter {
         });
 
         scrubber.addEventListener('input', () => {
+            if (this._scrubProxyCaching || !this._scrubProxyReady) return;
             if (this.isPlaying) this.stopPlayback();
-            this.currentFrame = parseInt(scrubber.value);
-            this.seekToFrame(this.currentFrame, { quality: 'fast' });
+            this._scrubbing = true;
+            this._cancelKeyPreviewTimers();
+            this.goToPreviewIndex(parseInt(scrubber.value, 10) || 0, { quality: 'fast' });
         });
 
-        // Pointer released / keyboard commit → full-resolution key
+        // Pointer released / keyboard commit → full-resolution key only.
+        // Read scrubber.value (source of truth) — previewIndex can lag a tick behind the range input.
+        let settleQueued = false;
         const settleFull = () => {
-            if (!this.videoLoaded || this.previewMode === 'original') return;
-            this.updatePreview({ quality: 'full' });
+            if (settleQueued) return;
+            settleQueued = true;
+            // Defer so final `input` events in the same gesture land first
+            requestAnimationFrame(() => {
+                settleQueued = false;
+                this._scrubbing = false;
+                if (!this.videoLoaded) return;
+                const idx = parseInt(scrubber.value, 10);
+                this.goToPreviewIndex(Number.isFinite(idx) ? idx : this.previewIndex | 0, {
+                    quality: 'full',
+                });
+            });
         };
         scrubber.addEventListener('change', settleFull);
         scrubber.addEventListener('pointerup', settleFull);
+        scrubber.addEventListener('pointercancel', settleFull);
 
         prevBtn.addEventListener('click', () => {
+            if (this._scrubProxyCaching || !this._scrubProxyReady) return;
             if (this.isPlaying) this.stopPlayback();
-            this.currentFrame = Math.max(0, this.currentFrame - 1);
-            document.getElementById('exScrubber').value = this.currentFrame;
-            this.seekToFrame(this.currentFrame, { quality: 'full' });
+            this._scrubbing = false;
+            this.stepPreview(-1, { quality: 'full' });
         });
 
         nextBtn.addEventListener('click', () => {
+            if (this._scrubProxyCaching || !this._scrubProxyReady) return;
             if (this.isPlaying) this.stopPlayback();
-            this.currentFrame = Math.min(this.totalFrames - 1, this.currentFrame + 1);
-            document.getElementById('exScrubber').value = this.currentFrame;
-            this.seekToFrame(this.currentFrame, { quality: 'full' });
+            this._scrubbing = false;
+            this.stepPreview(1, { quality: 'full' });
         });
+    }
+
+    /**
+     * Ordered source-frame indices that export will use (range + skip + reverse/ping-pong).
+     * Same construction as WebM/GIF export frameList.
+     */
+    buildExportSourceFrameList() {
+        const last = Math.max(0, (this.totalFrames | 0) - 1);
+        const startRaw = parseInt(document.getElementById('exStartFrame')?.value, 10);
+        const endRaw = parseInt(document.getElementById('exEndFrame')?.value, 10);
+        let startF = Number.isFinite(startRaw) ? startRaw : 0;
+        let endF = Number.isFinite(endRaw) ? endRaw : last;
+        startF = Math.max(0, Math.min(last, startF));
+        endF = Math.max(0, Math.min(last, endF));
+        if (endF < startF) {
+            const t = startF;
+            startF = endF;
+            endF = t;
+        }
+        const skip = Math.max(1, (parseInt(document.getElementById('exFrameSkip')?.value, 10) || 0) + 1);
+
+        const frameList = [];
+        for (let f = startF; f <= endF; f += skip) frameList.push(f);
+        if (this.pingPongMode && frameList.length > 2) {
+            for (let i = frameList.length - 2; i >= 1; i--) frameList.push(frameList[i]);
+        } else if (this.reverseMode && frameList.length > 1) {
+            frameList.reverse();
+        }
+        return frameList;
+    }
+
+    /**
+     * Rebuild export-timeline scrubber from current Start/End/Skip + loop mode.
+     * Scrubber only allows frames that will actually be exported.
+     */
+    syncPreviewTimeline(opts = {}) {
+        const seek = opts.seek !== false;
+        const quality = opts.quality || 'full';
+        const prevSrc = this.currentFrame;
+        const list = this.videoLoaded ? this.buildExportSourceFrameList() : [];
+        this._previewSourceList = list;
+
+        const maxIdx = Math.max(0, list.length - 1);
+        // Prefer staying on the same source frame if it is still in the export list
+        const keepIdx = list.indexOf(prevSrc);
+        if (keepIdx >= 0) {
+            this.previewIndex = keepIdx;
+        } else {
+            if (!Number.isFinite(this.previewIndex) || this.previewIndex < 0) this.previewIndex = 0;
+            if (this.previewIndex > maxIdx) this.previewIndex = maxIdx;
+        }
+
+        const scrubber = document.getElementById('exScrubber');
+        if (scrubber) {
+            scrubber.min = '0';
+            scrubber.max = String(maxIdx);
+            scrubber.value = String(this.previewIndex);
+            const mode = this.pingPongMode
+                ? 'ping-pong'
+                : this.reverseMode
+                  ? 'reverse'
+                  : 'forward';
+            scrubber.title =
+                list.length > 0
+                    ? `Export timeline (${list.length} frames, ${mode}). Scrubs only the export range.`
+                    : 'No frames in export range';
+        }
+
+        const src = list.length > 0 ? list[this.previewIndex] : 0;
+        this.currentFrame = src;
+        this.updateFrameInfo();
+
+        if (seek && this.videoLoaded && list.length > 0) {
+            this.seekToFrame(src, { quality });
+        }
+    }
+
+    /** Jump to an export-timeline index and show the mapped source frame. */
+    goToPreviewIndex(index, opts = {}) {
+        const list = this._previewSourceList?.length
+            ? this._previewSourceList
+            : this.buildExportSourceFrameList();
+        this._previewSourceList = list;
+        if (list.length === 0) {
+            this.previewIndex = 0;
+            this.currentFrame = 0;
+            this.updateFrameInfo();
+            return;
+        }
+        const maxIdx = list.length - 1;
+        let i = parseInt(index, 10);
+        if (!Number.isFinite(i)) i = 0;
+        i = Math.max(0, Math.min(maxIdx, i));
+        this.previewIndex = i;
+        this.currentFrame = list[i];
+
+        const scrubber = document.getElementById('exScrubber');
+        if (scrubber) scrubber.value = String(i);
+
+        this.seekToFrame(this.currentFrame, { quality: opts.quality || 'full' });
+    }
+
+    /** Step ±1 on the export timeline (wraps at ends). */
+    stepPreview(delta, opts = {}) {
+        const list = this._previewSourceList?.length
+            ? this._previewSourceList
+            : this.buildExportSourceFrameList();
+        this._previewSourceList = list;
+        if (list.length === 0) return;
+        const n = list.length;
+        let i = (this.previewIndex | 0) + (delta | 0);
+        // Wrap for next/prev convenience
+        if (i < 0) i = n - 1;
+        if (i >= n) i = 0;
+        this.goToPreviewIndex(i, opts);
     }
 
     startPlayback() {
         if (!this.videoLoaded) return;
+        // Ensure timeline matches latest start/end/skip before playing
+        this.syncPreviewTimeline({ seek: false });
+        const list = this._previewSourceList || [];
+        if (list.length === 0) return;
+
         this.isPlaying = true;
         document.getElementById('exPlayBtn').textContent = '⏸';
 
-        const frameInterval = 1000 / this.fps;
+        // Match export playback rate when keep-speed / skip adjust FPS
+        const exportFps = typeof this.getExportFps === 'function' ? this.getExportFps() : this.fps;
+        const frameInterval = 1000 / Math.max(1, exportFps || this.fps || 30);
         this.playTimer = setInterval(() => {
-            this.currentFrame++;
-            if (this.currentFrame >= this.totalFrames) {
-                this.currentFrame = 0;
+            const frames = this._previewSourceList || [];
+            if (frames.length === 0) {
+                this.stopPlayback();
+                return;
             }
-            // Half-res keyed frames keep playback closer to realtime.
+            this.previewIndex = (this.previewIndex + 1) % frames.length;
+            this.currentFrame = frames[this.previewIndex];
+            const scrubber = document.getElementById('exScrubber');
+            if (scrubber) scrubber.value = String(this.previewIndex);
+            this.updateFrameInfo();
+            // Play uses unkeyed 1/4 proxies only — no chroma strobe.
             this.seekToFrame(this.currentFrame, { quality: 'fast' });
-            document.getElementById('exScrubber').value = this.currentFrame;
         }, frameInterval);
     }
 
     stopPlayback() {
         this.isPlaying = false;
+        this._scrubbing = false;
         document.getElementById('exPlayBtn').textContent = '▶️';
         if (this.playTimer) {
             clearInterval(this.playTimer);
             this.playTimer = null;
         }
-        // Settle to full-res key on the paused frame.
-        if (this.videoLoaded && this.previewMode !== 'original') {
-            this.updatePreview({ quality: 'full' });
+        // Settle to full-res keyed preview on the paused frame.
+        if (this.videoLoaded) {
+            this.seekToFrame(this.currentFrame, { quality: 'full' });
+        }
+    }
+
+    _cancelKeyPreviewTimers() {
+        if (this._keyPreviewTimer) {
+            clearTimeout(this._keyPreviewTimer);
+            this._keyPreviewTimer = null;
+        }
+        if (this._keyPreviewFullTimer) {
+            clearTimeout(this._keyPreviewFullTimer);
+            this._keyPreviewFullTimer = null;
+        }
+        // Invalidate in-flight async key jobs
+        this._previewGen = (this._previewGen | 0) + 1;
+    }
+
+    _clearLocalScrubProxy() {
+        this._scrubProxyFrames = null;
+        this._scrubProxyPw = 0;
+        this._scrubProxyPh = 0;
+        this._scrubProxyKey = '';
+    }
+
+    /** Identity key for the currently loaded clip's proxy bank. */
+    _scrubProxyIdentityKey() {
+        const total = this.totalFrames | 0;
+        const vw = this.videoWidth | 0;
+        const vh = this.videoHeight | 0;
+        let blobSize = this._videoBlobSize | 0;
+        if (!blobSize) {
+            try {
+                const b = __hooks.ASAdventurer?.handoff?.videoPrepData?.blob;
+                if (b && typeof b.size === 'number') blobSize = b.size;
+            } catch {
+                /* ignore */
+            }
+        }
+        return `${blobSize | 0}:${total}:${vw}x${vh}`;
+    }
+
+    /**
+     * After a new video is loaded: drop any bank that isn't for this clip,
+     * allocate a fresh empty bank, adopt Prep's bank only on exact key match.
+     */
+    _resetScrubProxiesForCurrentVideo() {
+        const key = this._scrubProxyIdentityKey();
+        // Invalidate shared pipeline bank if it belongs to another file
+        try {
+            const shared =
+                typeof __hooks.getScrubProxy === 'function' ? __hooks.getScrubProxy() : null;
+            if (shared && shared.key && shared.key !== key) {
+                if (typeof __hooks.setScrubProxy === 'function') __hooks.setScrubProxy(null);
+            }
+        } catch {
+            /* ignore */
+        }
+        this._clearLocalScrubProxy();
+        this._ensureScrubProxyBank();
+    }
+
+    /**
+     * Attach shared Video Prep proxies when the *exact* clip matches; else allocate a local bank.
+     */
+    _ensureScrubProxyBank() {
+        if (!this.videoLoaded || this.totalFrames < 1) return null;
+        const total = this.totalFrames | 0;
+        const vw = this.videoWidth | 0;
+        const vh = this.videoHeight | 0;
+        const key = this._scrubProxyIdentityKey();
+
+        // Reuse shared bank from Video Prep only when key + fill match this clip
+        try {
+            const shared = typeof __hooks.getScrubProxy === 'function' ? __hooks.getScrubProxy() : null;
+            if (
+                shared &&
+                shared.frames &&
+                shared.key === key &&
+                shared.totalFrames === total &&
+                shared.frames.length === total &&
+                shared.videoWidth === vw &&
+                shared.videoHeight === vh
+            ) {
+                const filled = shared.frames.reduce((n, c) => n + (c ? 1 : 0), 0);
+                if (filled >= Math.max(1, Math.floor(total * 0.95))) {
+                    this._scrubProxyFrames = shared.frames;
+                    this._scrubProxyScale = shared.scale || 4;
+                    this._scrubProxyPw = shared.pw;
+                    this._scrubProxyPh = shared.ph;
+                    this._scrubProxyKey = shared.key || key;
+                    return this._scrubProxyFrames;
+                }
+            }
+        } catch {
+            /* ignore */
+        }
+
+        // Keep existing local bank only if it is for this exact clip
+        if (
+            this._scrubProxyFrames &&
+            this._scrubProxyFrames.length === total &&
+            this._scrubProxyKey === key
+        ) {
+            return this._scrubProxyFrames;
+        }
+
+        const scale = this._scrubProxyScale || 4;
+        const pw = Math.max(1, Math.round(vw / scale));
+        const ph = Math.max(1, Math.round(vh / scale));
+        this._scrubProxyFrames = new Array(total).fill(null);
+        this._scrubProxyPw = pw;
+        this._scrubProxyPh = ph;
+        this._scrubProxyKey = key;
+        return this._scrubProxyFrames;
+    }
+
+    /** Show/hide Prep-style spinner overlay + disable scrub controls while caching. */
+    _setScrubProxyCachingUi(caching, statusText = '', hintText = '') {
+        this._scrubProxyCaching = !!caching;
+        const container = document.getElementById('exCanvasContainer');
+        const overlay = document.getElementById('exCacheOverlay');
+        const statusEl = document.getElementById('exCacheStatus');
+        const hintEl = document.getElementById('exCacheHint');
+        if (container) container.classList.toggle('is-caching', !!caching);
+        if (overlay) overlay.classList.toggle('hidden', !caching);
+        if (statusEl && statusText) statusEl.textContent = statusText;
+        if (hintEl && hintText) hintEl.textContent = hintText;
+
+        const scrubber = document.getElementById('exScrubber');
+        const prevBtn = document.getElementById('exPrevFrame');
+        const nextBtn = document.getElementById('exNextFrame');
+        const playBtn = document.getElementById('exPlayBtn');
+        const disabled = !!caching || !this._scrubProxyReady;
+        if (scrubber) scrubber.disabled = disabled;
+        if (prevBtn) prevBtn.disabled = disabled;
+        if (nextBtn) nextBtn.disabled = disabled;
+        if (playBtn) playBtn.disabled = disabled;
+        if (scrubber) {
+            scrubber.title = disabled
+                ? 'Wait for scrub preview to finish building'
+                : 'Scrub through the export timeline (start–end, skip, reverse/ping-pong)';
+        }
+    }
+
+    _setScrubProxyReady(ready) {
+        this._scrubProxyReady = !!ready;
+        if (!this._scrubProxyCaching) {
+            this._setScrubProxyCachingUi(false);
+        } else {
+            // Keep controls disabled while overlay is up
+            const scrubber = document.getElementById('exScrubber');
+            const prevBtn = document.getElementById('exPrevFrame');
+            const nextBtn = document.getElementById('exNextFrame');
+            const playBtn = document.getElementById('exPlayBtn');
+            if (scrubber) scrubber.disabled = true;
+            if (prevBtn) prevBtn.disabled = true;
+            if (nextBtn) nextBtn.disabled = true;
+            if (playBtn) playBtn.disabled = true;
         }
     }
 
     /**
-     * @param {number} frameNum
+     * Blocking 1/N unkeyed proxy bank (spinner overlay, like Video Prep).
+     * Does not interleave with user scrub — scrub controls stay disabled until ready.
+     * Rejects blank/undecoded captures so black frames are not stored permanently.
+     */
+    async _buildScrubProxyCache(gen) {
+        if (!this.video || !this.videoLoaded) return;
+        if (gen !== this._scrubProxyBuildGen) return;
+
+        const video = this.video;
+        const total = this.totalFrames | 0;
+        const fps = Math.max(1, this.fps || 30);
+        const duration = this.duration || video.duration || 0;
+        if (total < 1 || this.videoWidth < 1) return;
+
+        const bank = this._ensureScrubProxyBank();
+        if (!bank) return;
+
+        const already = bank.reduce((n, c) => n + (c ? 1 : 0), 0);
+        if (already >= Math.max(1, Math.floor(total * 0.95))) {
+            this._maybePublishScrubProxy();
+            this._setScrubProxyReady(true);
+            this._setScrubProxyCachingUi(false);
+            return;
+        }
+
+        this.stopPlayback();
+        this._scrubbing = false;
+        this._setScrubProxyReady(false);
+        this._setScrubProxyCachingUi(
+            true,
+            `Building scrub preview (1/${this._scrubProxyScale || 4})…`,
+            'Building low-res scrub proxies — full keyed quality when you release the scrubber'
+        );
+
+        const stillActive = () =>
+            gen === this._scrubProxyBuildGen &&
+            this.video === video &&
+            this.videoLoaded &&
+            this._scrubProxyFrames === bank;
+
+        const report = (filled) => {
+            this._setScrubProxyCachingUi(
+                true,
+                `Scrub preview 1/${this._scrubProxyScale || 4}: ${filled} / ${total} frames`,
+                'Please wait — scrubbing unlocks when this finishes'
+            );
+        };
+
+        const maxT = Math.max(0, duration - 0.001);
+        let unique = already;
+        report(unique);
+
+        // ── Pass 1: 1× play-through (fast, same idea as Video Prep) ──
+        try {
+            await this.seekToAsync(0, { force: true });
+            if (!stillActive()) {
+                this._setScrubProxyCachingUi(false);
+                return;
+            }
+
+            await new Promise((resolve) => {
+                let settled = false;
+                const finish = () => {
+                    if (settled) return;
+                    settled = true;
+                    try {
+                        video.pause();
+                        video.playbackRate = 1;
+                    } catch {
+                        /* ignore */
+                    }
+                    resolve();
+                };
+
+                const frameIndexAt = (t) =>
+                    Math.min(total - 1, Math.max(0, Math.floor(t * fps + 1e-4)));
+
+                const onPresented = (_now, meta) => {
+                    if (settled || !stillActive()) {
+                        finish();
+                        return;
+                    }
+                    const t = meta?.mediaTime ?? video.currentTime;
+                    const idx = frameIndexAt(t);
+                    if (!bank[idx]) {
+                        const cap = this._captureScrubProxyFromVideo(idx, {
+                            force: true,
+                            rejectBlank: true,
+                        });
+                        if (cap) {
+                            unique++;
+                            if (unique % 4 === 0 || unique === total) report(unique);
+                        }
+                    }
+                    if (unique >= total || video.ended || t >= duration - 0.5 / fps) {
+                        finish();
+                        return;
+                    }
+                    schedule();
+                };
+
+                const schedule = () => {
+                    if (settled) return;
+                    const v = video;
+                    if (typeof v.requestVideoFrameCallback === 'function') {
+                        v.requestVideoFrameCallback(onPresented);
+                    } else {
+                        requestAnimationFrame((now) => onPresented(now));
+                    }
+                };
+
+                video.playbackRate = 1;
+                schedule();
+                void video.play().catch(() => finish());
+                setTimeout(finish, Math.min(120000, duration * 1000 * 2.5 + 4000));
+            });
+        } catch {
+            /* seek-fill below */
+        }
+
+        if (!stillActive()) {
+            this._setScrubProxyCachingUi(false);
+            return;
+        }
+
+        // ── Pass 2: seek-fill holes (skip redundant EOF seeks) ──
+        this._setScrubProxyCachingUi(
+            true,
+            `Filling scrub gaps… ${unique} / ${total}`,
+            'Almost done — remaining frames'
+        );
+        let lastSeekTime = -1;
+        for (let i = 0; i < total; i++) {
+            if (!stillActive()) {
+                this._setScrubProxyCachingUi(false);
+                return;
+            }
+            if (bank[i]) continue;
+            const t = Math.min(Math.max(0, (i + 0.5) / fps), maxT);
+
+            if (
+                lastSeekTime >= 0 &&
+                Math.abs(t - lastSeekTime) < 0.0005 &&
+                !video.seeking &&
+                video.readyState >= 2
+            ) {
+                const cap = this._captureScrubProxyFromVideo(i, {
+                    force: true,
+                    rejectBlank: true,
+                });
+                if (cap) unique++;
+                else if (i > 0 && bank[i - 1]) {
+                    bank[i] = bank[i - 1];
+                    unique++;
+                }
+                continue;
+            }
+
+            try {
+                await this.seekToAsync(t, { force: false });
+            } catch {
+                /* neighbor fill */
+            }
+            if (!stillActive()) {
+                this._setScrubProxyCachingUi(false);
+                return;
+            }
+            lastSeekTime = video.currentTime;
+            // Wait one frame so we don't bake an undecoded black buffer
+            await this.waitForPresentedFrame(video, 48);
+            if (!stillActive()) {
+                this._setScrubProxyCachingUi(false);
+                return;
+            }
+
+            const cap = this._captureScrubProxyFromVideo(i, {
+                force: true,
+                rejectBlank: true,
+            });
+            if (cap) unique++;
+            else if (i > 0 && bank[i - 1]) {
+                bank[i] = bank[i - 1];
+                unique++;
+            }
+            if (i % 6 === 0 || i === total - 1) report(unique);
+        }
+
+        if (!stillActive()) {
+            this._setScrubProxyCachingUi(false);
+            return;
+        }
+
+        // Neighbor fill remaining nulls
+        let last = null;
+        for (let i = 0; i < total; i++) {
+            if (bank[i]) last = bank[i];
+            else if (last) bank[i] = last;
+        }
+        let next = null;
+        for (let i = total - 1; i >= 0; i--) {
+            if (bank[i]) next = bank[i];
+            else if (next) bank[i] = next;
+        }
+
+        this._maybePublishScrubProxy();
+        this._setScrubProxyReady(true);
+        this._setScrubProxyCachingUi(false);
+
+        // Restore to frame 0 / current for keyed settle (caller paints after await)
+        try {
+            video.pause();
+            video.playbackRate = 1;
+            await this.seekToAsync(this._sourceFrameTime(this.currentFrame | 0), {
+                force: true,
+            });
+        } catch {
+            /* ignore */
+        }
+    }
+
+    /** Nearest filled proxy index for blank-free scrub while the bank is sparse. */
+    _nearestScrubProxyIndex(sourceFrame) {
+        const bank = this._scrubProxyFrames;
+        if (!bank?.length) return -1;
+        const idx = sourceFrame | 0;
+        if (bank[idx]) return idx;
+        for (let d = 1; d < bank.length; d++) {
+            if (idx - d >= 0 && bank[idx - d]) return idx - d;
+            if (idx + d < bank.length && bank[idx + d]) return idx + d;
+        }
+        return -1;
+    }
+
+    /**
+     * Paint unkeyed 1/N proxy upscaled to the preview canvas.
+     * Never clears without a drawable proxy (avoids full blank mid-scrub).
+     * @returns {boolean} true if a proxy was drawn
+     */
+    _paintScrubProxy(sourceFrame) {
+        if (!this.previewCtx || !this.videoLoaded) return false;
+        const bank = this._ensureScrubProxyBank();
+        if (!bank) return false;
+        let idx = sourceFrame | 0;
+        let proxy = bank[idx];
+        if (!proxy || proxy.width < 1 || proxy.height < 1) {
+            const near = this._nearestScrubProxyIndex(idx);
+            if (near < 0) return false;
+            idx = near;
+            proxy = bank[near];
+            if (!proxy || proxy.width < 1 || proxy.height < 1) return false;
+        }
+
+        const w = this.videoWidth;
+        const h = this.videoHeight;
+        if (w < 1 || h < 1) return false;
+        // Composite like export: scale/offset on the full canvas
+        const scale = this.videoScale || 1;
+        const vOffset = this.videoOffset || 0;
+        const sw = Math.max(1, Math.round(w * scale));
+        const sh = Math.max(1, Math.round(h * scale));
+        const dx = Math.round((w - sw) / 2);
+        const dy = Math.round((h - sh) / 2) + vOffset;
+
+        this.previewCtx.imageSmoothingEnabled = true;
+        this.previewCtx.imageSmoothingQuality = 'low';
+        // Opaque backdrop first — never clearRect-to-transparent alone (looks blank)
+        if (this.previewMode === 'white') {
+            this.previewCtx.fillStyle = '#fff';
+        } else if (this.previewMode === 'black' || this.previewMode === 'original') {
+            this.previewCtx.fillStyle = this.previewMode === 'original' ? '#1a1a1a' : '#000';
+        } else {
+            // checker: dark fill under content so checker only shows in letterbox
+            this.previewCtx.fillStyle = '#1a1a1a';
+        }
+        this.previewCtx.fillRect(0, 0, w, h);
+        this.previewCtx.drawImage(proxy, 0, 0, proxy.width, proxy.height, dx, dy, sw, sh);
+        return true;
+    }
+
+    /**
+     * True when a canvas sample looks like an undecoded / black frame (do not store).
+     */
+    _isBlankCapture(ctx, pw, ph) {
+        try {
+            const sw = Math.min(pw, 48);
+            const sh = Math.min(ph, 48);
+            const d = ctx.getImageData(0, 0, sw, sh).data;
+            let lit = 0;
+            let samples = 0;
+            for (let i = 0; i < d.length; i += 16) {
+                samples++;
+                if (d[i] + d[i + 1] + d[i + 2] > 30) lit++;
+            }
+            return lit < Math.max(2, samples * 0.02);
+        } catch {
+            return false;
+        }
+    }
+
+    /**
+     * Capture current video frame into the scrub proxy bank (1/N, unkeyed).
+     * @param {number} sourceFrame
+     * @param {{ force?: boolean, rejectBlank?: boolean }} [opts]
+     */
+    _captureScrubProxyFromVideo(sourceFrame, opts = {}) {
+        if (!this.video || !this.videoLoaded) return null;
+        const bank = this._ensureScrubProxyBank();
+        if (!bank) return null;
+        const idx = sourceFrame | 0;
+        if (idx < 0 || idx >= bank.length) return null;
+        if (bank[idx] && !opts.force) return bank[idx];
+
+        // Avoid baking black frames while the decoder has not presented
+        if (this.video.readyState < 2) return null;
+
+        const pw = this._scrubProxyPw || Math.max(1, Math.round(this.videoWidth / 4));
+        const ph = this._scrubProxyPh || Math.max(1, Math.round(this.videoHeight / 4));
+        try {
+            const c = bank[idx] || document.createElement('canvas');
+            c.width = pw;
+            c.height = ph;
+            const ctx = c.getContext('2d', { alpha: false });
+            if (!ctx) return null;
+            ctx.imageSmoothingEnabled = true;
+            ctx.imageSmoothingQuality = 'low';
+            ctx.drawImage(
+                this.video,
+                0,
+                0,
+                this.video.videoWidth,
+                this.video.videoHeight,
+                0,
+                0,
+                pw,
+                ph
+            );
+            if (opts.rejectBlank !== false && this._isBlankCapture(ctx, pw, ph)) {
+                // Leave slot empty — neighbor fill or a later seek will replace it
+                return null;
+            }
+            bank[idx] = c;
+            return c;
+        } catch {
+            return null;
+        }
+    }
+
+    /** Target media time for a source frame (matches export harvest). */
+    _sourceFrameTime(frameNum) {
+        if (typeof this.frameTimeSeconds === 'function') {
+            return this.frameTimeSeconds(frameNum | 0);
+        }
+        const fps = Math.max(1, this.fps || 30);
+        let t = ((frameNum | 0) + 0.5) / fps;
+        if (this.duration > 0) t = Math.min(t, Math.max(this.duration - 0.001, 0));
+        return Math.max(0, t);
+    }
+
+    _maybePublishScrubProxy() {
+        if (typeof __hooks.setScrubProxy !== 'function') return;
+        if (!this._scrubProxyFrames || !this._scrubProxyKey) return;
+        const total = this.totalFrames | 0;
+        const filled = this._scrubProxyFrames.reduce((n, c) => n + (c ? 1 : 0), 0);
+        // Never publish sparse banks — Prep would adopt them and skip building
+        if (filled < Math.max(1, Math.floor(total * 0.95))) return;
+        try {
+            __hooks.setScrubProxy({
+                key: this._scrubProxyKey,
+                totalFrames: total,
+                videoWidth: this.videoWidth | 0,
+                videoHeight: this.videoHeight | 0,
+                scale: this._scrubProxyScale || 4,
+                pw: this._scrubProxyPw,
+                ph: this._scrubProxyPh,
+                frames: this._scrubProxyFrames,
+            });
+        } catch {
+            /* ignore */
+        }
+    }
+
+    /**
+     * @param {number} frameNum source frame index
      * @param {{ quality?: 'fast' | 'full' }} [opts]
+     *   fast = unkeyed 1/4 proxy only (scrub/play) — no chroma
+     *   full = force seek + wait for presented frame + native-res chroma (settle)
      */
     seekToFrame(frameNum, opts = {}) {
         const quality = opts.quality || 'full';
-        const time = frameNum / this.fps;
-        const targetTime = Math.min(time, this.duration - 0.001);
+        this.currentFrame = frameNum | 0;
         this.updateFrameInfo();
 
-        // Fast scrub: show lo-res keyed thumbnail immediately if we have one (avoids blank flash).
-        const hasLo =
-            quality === 'fast' &&
-            this.previewMode !== 'original' &&
-            this._scrubLoCache?.has(frameNum);
-        if (hasLo) {
-            const lo = this._scrubLoCache.get(frameNum);
-            if (lo) {
-                this._blitKeyedPreview(lo, lo.width, lo.height, this.videoWidth, this.videoHeight, true);
-            }
-        }
+        if (!this.video || !this.videoLoaded) return;
 
-        const paintUnkeyedShell = () => {
-            // Skip unkeyed draw when a lo-res keyed thumb is already on screen.
-            if (hasLo) return;
-            this.previewCtx.drawImage(this.video, 0, 0, this.videoWidth, this.videoHeight);
-        };
-
-        if (Math.abs(this.video.currentTime - targetTime) < 0.001) {
-            paintUnkeyedShell();
-            this._debouncedKeyPreview(quality);
-            return;
-        }
-
-        this.video.currentTime = targetTime;
-        this.video.addEventListener('seeked', () => {
-            paintUnkeyedShell();
-            this._debouncedKeyPreview(quality);
-        }, { once: true });
-    }
-
-    /**
-     * Debounced keyed preview.
-     * - fast: half-res GPU (or CPU) key for scrub/play
-     * - full: native-res key after settle
-     * @param {'fast' | 'full'} [quality]
-     */
-    _debouncedKeyPreview(quality = 'full') {
-        if (this._keyPreviewTimer) clearTimeout(this._keyPreviewTimer);
-        if (this._keyPreviewFullTimer) clearTimeout(this._keyPreviewFullTimer);
-
+        // ── Fast path: proxy-only from the completed bank (no live capture while scrubbing) ──
         if (quality === 'fast') {
-            // Near-immediate half-res key while dragging / playing.
-            const delay = this._previewGpuReady ? 16 : 80;
-            this._keyPreviewTimer = setTimeout(() => {
-                this.updatePreview({ quality: 'fast' });
-            }, delay);
-            // After interaction pauses, refine at full resolution.
-            this._keyPreviewFullTimer = setTimeout(() => {
-                if (!this.isPlaying) this.updatePreview({ quality: 'full' });
-            }, 320);
+            this._cancelKeyPreviewTimers();
+            if (!this._scrubProxyReady || this._scrubProxyCaching) return;
+            this._paintScrubProxy(this.currentFrame);
             return;
         }
 
-        const delay = this._previewGpuReady ? 40 : 160;
-        this._keyPreviewTimer = setTimeout(() => {
+        // ── Full settle: always force-seek (scrub often left video on a different frame) ──
+        // Proxy-only scrub never updates currentTime on cache hits, so "already there"
+        // would key the wrong high-res buffer. Also, in-flight scrub seeks can fire
+        // seeked for an intermediate time — use seekToAsync + seekSeq + time check.
+        this._cancelKeyPreviewTimers();
+        const seq = ++this._seekSeq;
+        const targetFrame = this.currentFrame;
+        const targetTime = this._sourceFrameTime(targetFrame);
+
+        // Instant feedback: keep showing the correct proxy while full key loads
+        this._paintScrubProxy(targetFrame);
+
+        void (async () => {
+            try {
+                await this.seekToAsync(targetTime, { force: true });
+            } catch (err) {
+                console.warn('[preview] settle seek failed:', err);
+            }
+            if (seq !== this._seekSeq || this._scrubbing) return;
+            // Must still be on the frame we settled on (user may have scrubbed again)
+            if ((this.currentFrame | 0) !== (targetFrame | 0)) return;
+
+            // Reject stale seeked: video must be near the intended slot
+            const t = this.video.currentTime;
+            if (Math.abs(t - targetTime) > Math.max(0.04, 0.6 / Math.max(1, this.fps || 30))) {
+                try {
+                    await this.seekToAsync(targetTime, { force: true });
+                } catch {
+                    /* ignore */
+                }
+                if (seq !== this._seekSeq || this._scrubbing) return;
+            }
+
+            // Refresh proxy from the verified decode (optional, keeps bank honest)
+            this._captureScrubProxyFromVideo(targetFrame, { force: true });
+            if (seq !== this._seekSeq || this._scrubbing) return;
             this.updatePreview({ quality: 'full' });
-        }, delay);
+        })();
     }
 
-    /** Lazy-init shared WebGPU chroma for interactive preview (not multi-frame export). */
+    /** Lazy-init shared WebGPU chroma for interactive preview. */
     async _ensurePreviewGpu() {
-        // Settings → CPU only: fully disable WebGPU for preview + export.
-        if (
+        // Settings → Preview mode CPU: no WebGPU for scrubbing.
+        const previewCpu =
             typeof localStorage !== 'undefined' &&
-            localStorage.getItem('as_export_accel') === 'cpu'
-        ) {
+            (localStorage.getItem('as_preview_accel') === 'cpu' ||
+                (localStorage.getItem('as_preview_accel') == null &&
+                    localStorage.getItem('as_export_accel') === 'cpu'));
+        if (previewCpu) {
             this._previewGpu = false;
             this._previewGpuReady = false;
             try {
@@ -1991,8 +2843,36 @@ export class ModelExporter {
         }
     }
 
+    /** Settings → Export mode: cpu | gpu */
+    _getExportPipelineMode() {
+        try {
+            const m = localStorage.getItem('as_export_mode');
+            if (m === 'gpu' || m === 'cpu') return m;
+        } catch {
+            /* ignore */
+        }
+        return 'cpu';
+    }
+
     updateFrameInfo() {
-        document.getElementById('exFrameInfo').textContent = `${this.currentFrame} / ${Math.max(0, this.totalFrames - 1)}`;
+        const el = document.getElementById('exFrameInfo');
+        if (!el) return;
+        const list = this._previewSourceList || [];
+        const n = list.length;
+        if (!this.videoLoaded || n === 0) {
+            el.textContent = '0 / 0';
+            return;
+        }
+        const idx = Math.max(0, Math.min(n - 1, this.previewIndex | 0));
+        const src = list[idx] ?? this.currentFrame;
+        const mode = this.pingPongMode ? ' ⇄' : this.reverseMode ? ' ←' : '';
+        // Export slot (1-based) / total export frames · source frame index
+        el.textContent = `${idx + 1} / ${n} · src ${src}${mode}`;
+        el.title = this.pingPongMode
+            ? 'Export timeline (ping-pong). Scrubber only covers frames that will be exported.'
+            : this.reverseMode
+              ? 'Export timeline (reverse). Scrubber only covers frames that will be exported.'
+              : 'Export timeline. Scrubber only covers Start–End with frame skip applied.';
     }
 
     // Compute average HSL saturation of an ImageData, excluding key-colored pixels
@@ -2032,20 +2912,23 @@ export class ModelExporter {
 
     // ─── PREVIEW RENDERING ───
     /**
-     * @param {{ quality?: 'fast' | 'full' }} [opts]
-     *   fast = half-res key (scrub/play), optionally from lo-res scrub cache
-     *   full = live seek frame at native res + full key (never from full-res cache)
+     * Full keyed preview (settle path only). Scrub/play use unkeyed 1/4 proxies via seekToFrame(fast).
+     * @param {{ quality?: 'fast' | 'full' }} [opts] — 'fast' is ignored (proxy path only)
      */
     updatePreview(opts = {}) {
         if (!this.videoLoaded) return;
+        // Scrubbing must never replace the proxy with a keyed flash mid-drag
+        if (this._scrubbing || this.isPlaying) {
+            if (!this._paintScrubProxy(this.currentFrame)) {
+                // Keep last pixels if any; avoid clearRect blank
+            }
+            return;
+        }
 
-        const quality = opts.quality || 'full';
         const w = this.videoWidth;
         const h = this.videoHeight;
         const scale = this.videoScale || 1;
         const vOffset = this.videoOffset || 0;
-        const scrubScale =
-            quality === 'fast' ? this._previewScrubScale || 0.5 : 1;
 
         if (this.previewMode === 'original') {
             this.previewCtx.clearRect(0, 0, w, h);
@@ -2053,45 +2936,27 @@ export class ModelExporter {
             const sh = Math.round(h * scale);
             const dx = Math.round((w - sw) / 2);
             const dy = Math.round((h - sh) / 2) + vOffset;
-            this.previewCtx.drawImage(this.video, 0, 0, this.video.videoWidth, this.video.videoHeight, dx, dy, sw, sh);
+            this.previewCtx.drawImage(
+                this.video,
+                0,
+                0,
+                this.video.videoWidth,
+                this.video.videoHeight,
+                dx,
+                dy,
+                sw,
+                sh
+            );
             return;
         }
 
-        // Process dimensions (half-res while scrubbing / playing).
-        const pw = Math.max(1, Math.round(w * scrubScale));
-        const ph = Math.max(1, Math.round(h * scrubScale));
-
-        // Fast path: reuse lo-res *keyed* scrub thumbnail if present (no re-key).
-        if (quality === 'fast' && this._scrubLoCache?.has(this.currentFrame)) {
-            const lo = this._scrubLoCache.get(this.currentFrame);
-            if (lo && lo.width === pw && lo.height === ph) {
-                this._blitKeyedPreview(lo, pw, ph, w, h, true);
-                return;
-            }
-        }
-
-        let srcCtx = this.workCtx;
-        if (scrubScale < 1) {
-            if (!this._previewLoCanvas) {
-                this._previewLoCanvas = document.createElement('canvas');
-                this._previewLoCtx = this._previewLoCanvas.getContext('2d', {
-                    willReadFrequently: true,
-                });
-            }
-            if (this._previewLoCanvas.width !== pw || this._previewLoCanvas.height !== ph) {
-                this._previewLoCanvas.width = pw;
-                this._previewLoCanvas.height = ph;
-            }
-            srcCtx = this._previewLoCtx;
-        }
-
-        // Always sample from the live video element (full path after settle seeks first).
-        srcCtx.clearRect(0, 0, pw, ph);
-        const sw = Math.round(pw * scale);
-        const sh = Math.round(ph * scale);
-        const dx = Math.round((pw - sw) / 2);
-        const dy = Math.round((ph - sh) / 2) + Math.round(vOffset * scrubScale);
-        srcCtx.drawImage(
+        // Native-res sample from the live video element (caller already sought).
+        this.workCtx.clearRect(0, 0, w, h);
+        const sw = Math.round(w * scale);
+        const sh = Math.round(h * scale);
+        const dx = Math.round((w - sw) / 2);
+        const dy = Math.round((h - sh) / 2) + vOffset;
+        this.workCtx.drawImage(
             this.video,
             0,
             0,
@@ -2102,20 +2967,11 @@ export class ModelExporter {
             sw,
             sh
         );
-        const imageData = srcCtx.getImageData(0, 0, pw, ph);
+        const imageData = this.workCtx.getImageData(0, 0, w, h);
 
-        // Prefer WebGPU for interactive keying; fall back to CPU ChromaKey.
         const gen = ++this._previewGen;
         const liveSettings = this.chromaKey.getSettings();
         const settings = { ...liveSettings };
-        if (quality === 'fast') {
-            settings.edgeFadeWidth = Math.max(
-                0,
-                Math.round(settings.edgeFadeWidth * scrubScale)
-            );
-            settings.antiAlias = false;
-            settings.smokeCleanup = false;
-        }
 
         const runCpuKey = () => {
             this.chromaKey.applySettings(settings);
@@ -2131,7 +2987,7 @@ export class ModelExporter {
         void (async () => {
             try {
                 const gpu = await this._ensurePreviewGpu();
-                if (gen !== this._previewGen) return;
+                if (gen !== this._previewGen || this._scrubbing || this.isPlaying) return;
 
                 if (gpu) {
                     await gpu.processPreviewFrame(imageData, settings);
@@ -2139,13 +2995,10 @@ export class ModelExporter {
                     runCpuKey();
                 }
 
-                if (gen !== this._previewGen || !this.videoLoaded) return;
+                if (gen !== this._previewGen || !this.videoLoaded || this._scrubbing) return;
 
-                if (quality === 'fast') {
-                    this._rememberScrubLo(this.currentFrame, imageData);
-                }
-
-                this._blitKeyedPreview(imageData, pw, ph, w, h, scrubScale < 1);
+                this.previewCtx.clearRect(0, 0, w, h);
+                this.previewCtx.putImageData(imageData, 0, 0);
             } catch (err) {
                 if (gen !== this._previewGen) return;
                 console.warn('[preview] GPU key failed, using CPU:', err);
@@ -2153,58 +3006,14 @@ export class ModelExporter {
                 this._previewGpuReady = false;
                 try {
                     runCpuKey();
-                    if (gen !== this._previewGen) return;
-                    if (quality === 'fast') {
-                        this._rememberScrubLo(this.currentFrame, imageData);
-                    }
-                    this._blitKeyedPreview(imageData, pw, ph, w, h, scrubScale < 1);
+                    if (gen !== this._previewGen || this._scrubbing) return;
+                    this.previewCtx.clearRect(0, 0, w, h);
+                    this.previewCtx.putImageData(imageData, 0, 0);
                 } catch (cpuErr) {
                     console.error('[preview] CPU key failed:', cpuErr);
                 }
             }
         })();
-    }
-
-    /** Store a copy of a half-res keyed scrub frame (LRU-ish cap). */
-    _rememberScrubLo(frameIndex, imageData) {
-        if (!this._scrubLoCache) this._scrubLoCache = new Map();
-        const copy = new ImageData(
-            new Uint8ClampedArray(imageData.data),
-            imageData.width,
-            imageData.height
-        );
-        // Refresh insertion order
-        if (this._scrubLoCache.has(frameIndex)) this._scrubLoCache.delete(frameIndex);
-        this._scrubLoCache.set(frameIndex, copy);
-        while (this._scrubLoCache.size > (this._scrubLoCacheMax || 48)) {
-            const oldest = this._scrubLoCache.keys().next().value;
-            this._scrubLoCache.delete(oldest);
-        }
-    }
-
-    /**
-     * Draw keyed ImageData to the preview canvas (upscale if half-res scrub).
-     */
-    _blitKeyedPreview(imageData, pw, ph, fullW, fullH, upscale) {
-        if (!upscale) {
-            this.previewCtx.clearRect(0, 0, fullW, fullH);
-            this.previewCtx.putImageData(imageData, 0, 0);
-            return;
-        }
-        // putImageData into lo canvas, then scale up with bilinear filtering.
-        if (!this._previewLoCanvas) {
-            this._previewLoCanvas = document.createElement('canvas');
-            this._previewLoCtx = this._previewLoCanvas.getContext('2d');
-        }
-        if (this._previewLoCanvas.width !== pw || this._previewLoCanvas.height !== ph) {
-            this._previewLoCanvas.width = pw;
-            this._previewLoCanvas.height = ph;
-        }
-        this._previewLoCtx.putImageData(imageData, 0, 0);
-        this.previewCtx.clearRect(0, 0, fullW, fullH);
-        this.previewCtx.imageSmoothingEnabled = true;
-        this.previewCtx.imageSmoothingQuality = 'high';
-        this.previewCtx.drawImage(this._previewLoCanvas, 0, 0, pw, ph, 0, 0, fullW, fullH);
     }
 
     // ─── CROP OVERLAY ───
@@ -2351,6 +3160,12 @@ export class ModelExporter {
             this.updateSizeEstimate();
             this.updateVideoInfo();
             this.updateExportValidation();
+            // Keep scrubber locked to export range / order when range or skip changes
+            if (this.videoLoaded) {
+                const wasPlaying = this.isPlaying;
+                if (wasPlaying) this.stopPlayback();
+                this.syncPreviewTimeline({ seek: true, quality: 'fast' });
+            }
         };
 
         widthInput.addEventListener('change', () => {
@@ -2790,22 +3605,7 @@ export class ModelExporter {
     }
 
     getOutputFrameCount() {
-        const start = parseInt(document.getElementById('exStartFrame').value, 10);
-        const end = parseInt(document.getElementById('exEndFrame').value, 10);
-        const startF = Number.isFinite(start) ? start : 0;
-        const endF = Number.isFinite(end) ? end : Math.max(0, this.totalFrames - 1);
-        const skip = Math.max(1, (parseInt(document.getElementById('exFrameSkip')?.value, 10) || 0) + 1);
-
-        let count = 0;
-        for (let f = startF; f <= endF; f += skip) count++;
-
-        // Ping-pong: 0→N→0 without duplicating endpoints → n + (n - 2)
-        if (this.pingPongMode && count > 2) {
-            count = count + (count - 2);
-        }
-        // reverse uses the same count as forward (order only)
-
-        return count;
+        return this.buildExportSourceFrameList().length;
     }
 
     formatBytes(bytes) {
@@ -2851,20 +3651,11 @@ export class ModelExporter {
         const width = Math.min(parseInt(document.getElementById('exWidth').value) || this.videoWidth, limits.maxWidth);
         const height = Math.min(parseInt(document.getElementById('exHeight').value) || this.videoHeight, limits.maxHeight);
         const exportFps = this.getExportFps();
-        const startFrame = parseInt(document.getElementById('exStartFrame').value, 10) || 0;
-        const endFrame = parseInt(document.getElementById('exEndFrame').value, 10) || 0;
-        const skip = Math.max(1, (parseInt(document.getElementById('exFrameSkip').value, 10) || 0) + 1);
         const videoScale = this.videoScale || 1;
         const videoOffset = this.videoOffset || 0;
 
-        // Build frame list
-        const frameList = [];
-        for (let f = startFrame; f <= endFrame; f += skip) frameList.push(f);
-        if (this.pingPongMode && frameList.length > 2) {
-            for (let i = frameList.length - 2; i >= 1; i--) frameList.push(frameList[i]);
-        } else if (this.reverseMode && frameList.length > 1) {
-            frameList.reverse();
-        }
+        // Same ordered source list as the preview scrubber (range + skip + reverse/ping-pong)
+        const frameList = this.buildExportSourceFrameList();
         const totalFrames = frameList.length;
 
         this.isExporting = true;
@@ -2883,29 +3674,33 @@ export class ModelExporter {
         this.stopPlayback();
 
         let sessionId = null;
+        /** @type {ChromaFrameProcessor | null} */
+        let chromaProcessor = null;
+        const exportT0 = performance.now();
 
         try {
             progressText.textContent = 'Capturing · starting…';
             this._exportAbort = new AbortController();
             const signal = this._exportAbort.signal;
 
-            // Pick chroma backend first so the session can use raw RGBA (GPU) or PNG (CPU).
-            /** @type {ChromaFrameProcessor | null} */
-            let chromaProcessor = null;
+            const exportMode = this._getExportPipelineMode();
+            // Pick chroma backend: cpu → workers+PNG; gpu → WebGPU+raw (fallback CPU+PNG).
             /** @type {'png' | 'rgba'} */
             let frameFormat = 'png';
             try {
-                // prefer is resolved inside createChromaProcessor; CPU-only setting always wins.
-                chromaProcessor = await createChromaProcessor();
+                chromaProcessor = await createChromaProcessor(
+                    exportMode === 'gpu' ? { prefer: 'webgpu' } : { prefer: 'cpu' }
+                );
                 chromaProcessor.setRgbaEncoder?.(createDomPngEncoder());
                 if (
+                    exportMode === 'gpu' &&
                     chromaProcessor.backend === 'webgpu' &&
                     typeof chromaProcessor.processToRawRgba === 'function'
                 ) {
                     frameFormat = 'rgba';
                 }
                 console.info(
-                    `[export] chroma backend: ${chromaProcessor.backend}, frameFormat=${frameFormat}`
+                    `[export] mode=${exportMode} backend=${chromaProcessor.backend} frames=${frameFormat}`
                 );
             } catch (procErr) {
                 console.warn('[export] chroma processor unavailable, using main thread PNG:', procErr);
@@ -2948,8 +3743,16 @@ export class ModelExporter {
             const recCanvas = document.createElement('canvas');
             recCanvas.width = width;
             recCanvas.height = height;
-            const recCtx = recCanvas.getContext('2d', { willReadFrequently: true });
+            const recCtx =
+                recCanvas.getContext('2d', {
+                    willReadFrequently: true,
+                    colorSpace: 'srgb',
+                    alpha: true,
+                }) || recCanvas.getContext('2d', { willReadFrequently: true });
             if (!recCtx) throw new Error('Canvas 2D unavailable');
+            // Deterministic scale kernel (matches Server browser-decode path)
+            recCtx.imageSmoothingEnabled = true;
+            recCtx.imageSmoothingQuality = 'low';
 
             const drawScaled = () => {
                 recCtx.clearRect(0, 0, width, height);
@@ -3079,11 +3882,13 @@ export class ModelExporter {
                         : phase === 'processing'
                           ? 'Processing'
                           : 'Capturing';
+                const elapsed = this._formatElapsed(performance.now() - exportT0);
 
                 progressText.textContent =
                     `${label} · ${done}/${totalSteps} steps (${peakPct}%)` +
                     ` · frames ${framesDone}/${uniqueTotal}` +
-                    ` · uploads ${uploadsDone}/${totalFrames}`;
+                    ` · uploads ${uploadsDone}/${totalFrames}` +
+                    ` · ${elapsed}`;
             };
 
             /**
@@ -3218,7 +4023,8 @@ export class ModelExporter {
             /** @type {Promise<void>[]} */
             const allProcess = [];
             let processError = null;
-            const chromaSettings = this.chromaKey.getSettings();
+            // DOM-synced + normalized unit-scale settings for workers/WebGPU
+            const chromaSettings = this._collectChromaSettingsForExport();
 
             try {
                 await this.harvestSourceFrames(
@@ -3347,10 +4153,14 @@ export class ModelExporter {
                 this.lastExportFormat = 'webm';
 
                 const sizeStr = this.formatBytes(webmBlob.size);
+                const elapsed = this._formatElapsed(performance.now() - exportT0);
                 progressFill.style.width = '100%';
                 progressText.textContent =
-                    `Done! ${sizeStr} · ${outputFrames} frames · ${width}×${height}`;
-                __hooks.showToast(`WebM exported successfully! (${sizeStr})`, 'success');
+                    `Done! ${sizeStr} · ${outputFrames} frames · ${width}×${height} · ${elapsed}`;
+                __hooks.showToast(
+                    `WebM exported successfully! (${sizeStr} in ${elapsed})`,
+                    'success'
+                );
 
                 this.downloadBlob(webmBlob, 'webm');
 
@@ -3372,21 +4182,45 @@ export class ModelExporter {
                 sessionId = null;
             }
 
-            if (err?.name === 'AbortError' || err.message === 'cancelled') {
-                progressText.textContent = 'Export cancelled.';
+            if (err?.name === 'AbortError' || err?.message === 'cancelled') {
+                progressText.textContent =
+                    `Export cancelled · ${this._formatElapsed(performance.now() - exportT0)}`;
                 __hooks.showToast('Export cancelled', 'info');
             } else {
                 console.error('WebM export error:', err);
-                __hooks.showToast('Export failed: ' + err.message, 'error');
-                progressText.textContent = 'Export failed.';
+                __hooks.showToast('Export failed: ' + (err?.message || err), 'error');
+                progressText.textContent =
+                    `Export failed · ${this._formatElapsed(performance.now() - exportT0)}`;
+            }
+        } finally {
+            // Always reset UI so the user can export again.
+            this._exportAbort = null;
+            if (cancelBtn) cancelBtn.style.display = 'none';
+            this.isExporting = false;
+            this._exportCancelled = false;
+            const exportBtn = document.getElementById('exExportBtn');
+            if (exportBtn) exportBtn.disabled = false;
+            // Leave progress panel visible with final message; collapse after a short delay on success only
+            if (progressContainer && !/failed|cancelled/i.test(progressText?.textContent || '')) {
+                setTimeout(() => {
+                    if (!this.isExporting) {
+                        progressContainer.classList.remove('active');
+                    }
+                }, 4000);
             }
         }
+    }
 
-        this._exportAbort = null;
-        cancelBtn.style.display = 'none';
-        this.isExporting = false;
-        this._exportCancelled = false;
-        document.getElementById('exExportBtn').disabled = false;
+    /** Format elapsed ms as m:ss or h:mm:ss */
+    _formatElapsed(ms) {
+        const s = Math.max(0, Math.floor(ms / 1000));
+        const h = Math.floor(s / 3600);
+        const m = Math.floor((s % 3600) / 60);
+        const sec = s % 60;
+        if (h > 0) {
+            return `${h}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`;
+        }
+        return `${m}:${String(sec).padStart(2, '0')}`;
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -3412,20 +4246,11 @@ export class ModelExporter {
         const maxColors = 128;
         const exportFps = this.getExportFps();
         const delayCentiseconds = Math.max(2, Math.round(100 / exportFps));
-        const startFrame = parseInt(document.getElementById('exStartFrame').value) || 0;
-        const endFrame = parseInt(document.getElementById('exEndFrame').value) || 0;
-        const skip = Math.max(1, (parseInt(document.getElementById('exFrameSkip').value) || 0) + 1);
         const videoScale = this.videoScale || 1;
         const videoOffset = this.videoOffset || 0;
 
-        // Build frame list
-        const frameList = [];
-        for (let f = startFrame; f <= endFrame; f += skip) frameList.push(f);
-        if (this.pingPongMode && frameList.length > 2) {
-            for (let i = frameList.length - 2; i >= 1; i--) frameList.push(frameList[i]);
-        } else if (this.reverseMode && frameList.length > 1) {
-            frameList.reverse();
-        }
+        // Same ordered source list as the preview scrubber (range + skip + reverse/ping-pong)
+        const frameList = this.buildExportSourceFrameList();
         const totalFrames = frameList.length;
 
         this.isExporting = true;
@@ -3442,6 +4267,7 @@ export class ModelExporter {
         cancelBtn.style.display = 'inline-flex';
 
         this.stopPlayback();
+        const exportT0 = performance.now();
 
         try {
             // Create output canvas at export dimensions
@@ -3466,8 +4292,7 @@ export class ModelExporter {
             // ── GIF progress (matches phase totals) ──
             // total = capture + process + encode(1)
             // done  = capturedDone + processedDone + encodeDone
-            const uniqueFrames = [];
-            for (let f = startFrame; f <= endFrame; f += skip) uniqueFrames.push(f);
+            const uniqueFrames = [...new Set(frameList)].sort((a, b) => a - b);
             const uniqueTotal = uniqueFrames.length;
             const totalSteps = uniqueTotal + uniqueTotal + 1;
             let capturedDone = 0;
@@ -3495,10 +4320,12 @@ export class ModelExporter {
                         : phase === 'processing'
                           ? 'Processing'
                           : 'Capturing';
+                const elapsed = this._formatElapsed(performance.now() - exportT0);
                 progressText.textContent =
                     `${label} · ${done}/${totalSteps} steps (${peakPct}%)` +
                     ` · frames ${capturedDone}/${uniqueTotal}` +
-                    ` · proc ${processedDone}/${uniqueTotal}`;
+                    ` · proc ${processedDone}/${uniqueTotal}` +
+                    ` · ${elapsed}`;
             };
 
             phase = 'capturing';
@@ -3538,7 +4365,7 @@ export class ModelExporter {
                 console.warn('[export] chroma processor unavailable for GIF:', poolErr);
                 gifChromaProcessor = null;
             }
-            const chromaSettings = this.chromaKey.getSettings();
+            const chromaSettings = this._collectChromaSettingsForExport();
 
             /** @type {Map<number, any>} */
             const frameCache = new Map();
@@ -3866,9 +4693,10 @@ export class ModelExporter {
             encodeDone = 1;
             progressFill.style.width = '100%';
             const sizeStr = this.formatBytes(gifData.length);
+            const elapsed = this._formatElapsed(performance.now() - exportT0);
             progressText.textContent =
-                `Done! ${sizeStr} · ${outputFrames} frames · ${width}×${height}`;
-            __hooks.showToast(`GIF exported successfully! (${sizeStr})`, 'success');
+                `Done! ${sizeStr} · ${outputFrames} frames · ${width}×${height} · ${elapsed}`;
+            __hooks.showToast(`GIF exported successfully! (${sizeStr} in ${elapsed})`, 'success');
 
             // Auto-download
             this.downloadBlob(this.lastExportBlob, 'gif');
@@ -3877,20 +4705,26 @@ export class ModelExporter {
             if (__hooks.notificationSound) __hooks.notificationSound.play();
 
         } catch (err) {
+            const elapsed = this._formatElapsed(performance.now() - exportT0);
             if (err.message === 'cancelled') {
-                progressText.textContent = 'Export cancelled.';
+                progressText.textContent = `Export cancelled · ${elapsed}`;
                 __hooks.showToast('Export cancelled', 'info');
             } else {
                 console.error('GIF export error:', err);
                 __hooks.showToast('Export failed: ' + err.message, 'error');
-                progressText.textContent = 'Export failed.';
+                progressText.textContent = `Export failed · ${elapsed}`;
+            }
+        } finally {
+            cancelBtn.style.display = 'none';
+            this.isExporting = false;
+            this._exportCancelled = false;
+            document.getElementById('exExportBtn').disabled = false;
+            if (progressContainer && !/failed|cancelled/i.test(progressText?.textContent || '')) {
+                setTimeout(() => {
+                    if (!this.isExporting) progressContainer.classList.remove('active');
+                }, 4000);
             }
         }
-
-        cancelBtn.style.display = 'none';
-        this.isExporting = false;
-        this._exportCancelled = false;
-        document.getElementById('exExportBtn').disabled = false;
     }
 
     // ─── DOWNLOAD ───

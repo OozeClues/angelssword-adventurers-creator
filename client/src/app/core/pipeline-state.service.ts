@@ -44,6 +44,24 @@ export interface VideoPrepSource {
   fileName: string;
 }
 
+/**
+ * Low-res unkeyed scrub bank shared between Video Prep and Exporter.
+ * Built once in Video Prep (~1/4 scale); Exporter reuses for flicker-free scrub.
+ * Not persisted — session memory only.
+ */
+export interface VideoScrubProxyBank {
+  /** Match key: `${blobSize}:${totalFrames}:${vw}x${vh}` */
+  key: string;
+  totalFrames: number;
+  videoWidth: number;
+  videoHeight: number;
+  /** Downscale factor (e.g. 4 → 1/4 resolution). */
+  scale: number;
+  pw: number;
+  ph: number;
+  frames: (HTMLCanvasElement | null)[];
+}
+
 @Injectable({ providedIn: 'root' })
 export class PipelineStateService {
   readonly characterName = signal(localStorage.getItem('as_char_name') ?? '');
@@ -67,6 +85,12 @@ export class PipelineStateService {
    */
   readonly videoPrepSource = signal<VideoPrepSource | null>(null);
   readonly videoPrepConcatSource = signal<VideoPrepSource | null>(null);
+
+  /**
+   * Shared 1/N scrub proxies (unkeyed canvases). Video Prep builds;
+   * Exporter consumes so scrub does not re-decode or chroma-key every tick.
+   */
+  readonly videoScrubProxy = signal<VideoScrubProxyBank | null>(null);
 
   /** Incremented when a handoff should wake a target tab. */
   readonly spriteHandoffVersion = signal(0);
@@ -168,5 +192,19 @@ export class PipelineStateService {
     const url = URL.createObjectURL(blob);
     this.videoPrepConcatSource.set({ blob, url, fileName });
     return url;
+  }
+
+  /** Publish or clear the shared scrub proxy bank (Video Prep → Exporter). */
+  setVideoScrubProxy(bank: VideoScrubProxyBank | null): void {
+    this.videoScrubProxy.set(bank);
+  }
+
+  static scrubProxyKey(
+    blobSize: number,
+    totalFrames: number,
+    videoWidth: number,
+    videoHeight: number
+  ): string {
+    return `${blobSize | 0}:${totalFrames | 0}:${videoWidth | 0}x${videoHeight | 0}`;
   }
 }

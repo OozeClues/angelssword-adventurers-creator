@@ -89,6 +89,8 @@ export class ExporterComponent implements AfterViewInit, OnDestroy {
       initColorSwatches,
       getKeyColor: () => pipeline.keyColor(),
       setKeyColor: (hex: string) => pipeline.setKeyColor(hex),
+      getScrubProxy: () => pipeline.videoScrubProxy(),
+      setScrubProxy: (bank) => pipeline.setVideoScrubProxy(bank),
       ASAdventurer,
       notificationSound: { play: () => this.sound.play() },
     });

@@ -30,14 +30,33 @@ const COMFY_IMAGE_FREE_KEY = 'as_comfy_image_free_before';
 const COMFY_VIDEO_FREE_KEY = 'as_comfy_video_free_before';
 const COMFY_IMAGE_BIND_KEY = 'as_comfy_image_bindings';
 const COMFY_VIDEO_BIND_KEY = 'as_comfy_video_bindings';
-/** Export chroma acceleration: auto (WebGPU when available) or force CPU workers. */
-const EXPORT_ACCEL_KEY = 'as_export_accel';
+/**
+ * Preview (scrub) WebGPU: auto | cpu.
+ * Migrates legacy `as_export_accel` which used to mean both preview and export.
+ */
+const PREVIEW_ACCEL_KEY = 'as_preview_accel';
+/** Export pipeline: cpu (PNG) | gpu (WebGPU+raw). */
+const EXPORT_MODE_KEY = 'as_export_mode';
+/** @deprecated legacy key — migrated into preview + export settings */
+const LEGACY_EXPORT_ACCEL_KEY = 'as_export_accel';
 
-export type ExportAccelMode = 'auto' | 'cpu';
+export type PreviewAccelMode = 'auto' | 'cpu';
+export type ExportPipelineMode = 'cpu' | 'gpu';
 
-function loadExportAccelMode(): ExportAccelMode {
-  const raw = localStorage.getItem(EXPORT_ACCEL_KEY);
-  return raw === 'cpu' ? 'cpu' : 'auto';
+function loadPreviewAccelMode(): PreviewAccelMode {
+  const raw = localStorage.getItem(PREVIEW_ACCEL_KEY);
+  if (raw === 'cpu' || raw === 'auto') return raw;
+  // Migrate legacy toggle
+  const legacy = localStorage.getItem(LEGACY_EXPORT_ACCEL_KEY);
+  return legacy === 'cpu' ? 'cpu' : 'auto';
+}
+
+function loadExportPipelineMode(): ExportPipelineMode {
+  const raw = localStorage.getItem(EXPORT_MODE_KEY);
+  if (raw === 'cpu' || raw === 'gpu') return raw;
+  // Legacy: as_export_mode=server (removed) or as_export_accel=cpu → cpu
+  const legacy = localStorage.getItem(LEGACY_EXPORT_ACCEL_KEY);
+  return legacy === 'cpu' ? 'cpu' : 'cpu';
 }
 
 function loadXaiBackend(): XaiBackend {
@@ -220,10 +239,19 @@ export class SettingsService {
   readonly soundEnabled = signal(localStorage.getItem('as_sound_enabled') !== 'false');
 
   /**
-   * Export chroma path: `auto` uses WebGPU when available (raw RGBA + GPU key),
-   * `cpu` forces multi-core workers + PNG (safe fallback for bad drivers).
+   * Interactive Export-tab preview scrub: `auto` uses WebGPU when available.
    */
-  readonly exportAccelMode = signal<ExportAccelMode>(loadExportAccelMode());
+  readonly previewAccelMode = signal<PreviewAccelMode>(loadPreviewAccelMode());
+
+  /**
+   * Export pipeline:
+   * - cpu — browser workers + PNG → server ffmpeg (known-good)
+   * - gpu — browser WebGPU key + raw RGBA → server ffmpeg
+   */
+  readonly exportPipelineMode = signal<ExportPipelineMode>(loadExportPipelineMode());
+
+  /** @deprecated use previewAccelMode — kept for older call sites */
+  readonly exportAccelMode = this.previewAccelMode;
 
   /**
    * Master toggle: which Grok credential path is used for Imagine image/video.
@@ -1496,11 +1524,12 @@ export class SettingsService {
     localStorage.setItem('as_sound_enabled', String(enabled));
   }
 
-  setExportAccelMode(mode: ExportAccelMode): void {
-    const m: ExportAccelMode = mode === 'cpu' ? 'cpu' : 'auto';
-    this.exportAccelMode.set(m);
-    localStorage.setItem(EXPORT_ACCEL_KEY, m);
-    // Tear down any warm WebGPU session when forcing CPU-only.
+  setPreviewAccelMode(mode: PreviewAccelMode): void {
+    const m: PreviewAccelMode = mode === 'cpu' ? 'cpu' : 'auto';
+    this.previewAccelMode.set(m);
+    localStorage.setItem(PREVIEW_ACCEL_KEY, m);
+    // Keep legacy key in sync so older code paths still see the intent.
+    localStorage.setItem(LEGACY_EXPORT_ACCEL_KEY, m);
     if (m === 'cpu') {
       void import('../features/exporter/chroma-webgpu')
         .then((mod) => mod.disposeSharedPreviewWebGpu())
@@ -1508,6 +1537,17 @@ export class SettingsService {
           /* module may not be loaded */
         });
     }
+  }
+
+  /** @deprecated use setPreviewAccelMode */
+  setExportAccelMode(mode: PreviewAccelMode): void {
+    this.setPreviewAccelMode(mode);
+  }
+
+  setExportPipelineMode(mode: ExportPipelineMode): void {
+    const m: ExportPipelineMode = mode === 'gpu' || mode === 'cpu' ? mode : 'cpu';
+    this.exportPipelineMode.set(m);
+    localStorage.setItem(EXPORT_MODE_KEY, m);
   }
 
   /**

@@ -20,6 +20,7 @@ const os = require('os');
 const crypto = require('crypto');
 const { exec, execFile, spawn } = require('child_process');
 const comfy = require('./comfy');
+const { mkExportTemp } = require('./lib/export-temp.cjs');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -995,6 +996,16 @@ app.get('/api/export/status', async (_req, res) => {
 // --- Local ComfyUI (discovery + template workflows + generation) ---
 comfy.registerRoutes(app);
 
+// ── Shared export logging (timestamps for debugging) ───────────────
+function exportLog(msg, extra = '') {
+    const ts = new Date().toISOString();
+    console.log(`${ts}  [EXPORT] ${msg}${extra ? ' ' + extra : ''}`);
+}
+function exportLogError(msg, extra = '') {
+    const ts = new Date().toISOString();
+    console.error(`${ts}  [EXPORT][ERROR] ${msg}${extra ? ' ' + extra : ''}`);
+}
+
 // ── Session export: stream frames to disk as the browser extracts them ──
 // POST   /api/export/session              → { sessionId, format }
 // POST   /api/export/session/:id/frame?index=N  (PNG or raw RGBA)
@@ -1024,7 +1035,7 @@ setInterval(() => {
     const now = Date.now();
     for (const [id, s] of exportSessions) {
         if (now - s.created > SESSION_TTL_MS) {
-            console.log(`  [EXPORT] Reaping stale session ${id}`);
+            exportLog(`Reaping stale session ${id}`);
             destroyExportSession(id);
         }
     }
@@ -1222,17 +1233,18 @@ app.post('/api/export/session', async (req, res) => {
             });
         }
         const sessionId = crypto.randomBytes(16).toString('hex');
-        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'as-export-'));
+        // Prefer disk-backed temp (avoid WSL /tmp tmpfs ENOSPC)
+        const { dir: sessDir } = mkExportTemp(APP_DIR, 'as-export-');
         exportSessions.set(sessionId, {
-            dir,
+            dir: sessDir,
             frames: 0,
             created: Date.now(),
             format,
             width,
             height,
         });
-        console.log(
-            `  [EXPORT] Session ${sessionId} opened → ${dir} (${format}${format === 'rgba' ? ` ${width}x${height}` : ''})`
+        exportLog(
+            `Session ${sessionId} opened → ${sessDir} (${format}${format === 'rgba' ? ` ${width}x${height}` : ''})`
         );
         res.json({
             sessionId,
@@ -1330,8 +1342,8 @@ app.post('/api/export/session/:id/finalize', async (req, res) => {
     exportSessions.delete(req.params.id);
 
     try {
-        console.log(
-            `  [EXPORT] Finalize ${req.params.id}: ${frameCount} frames @ ${fps}fps (${format})`
+        exportLog(
+            `Finalize ${req.params.id}: ${frameCount} frames @ ${fps}fps (${format})`
         );
         const outPath =
             format === 'rgba'
@@ -1348,7 +1360,7 @@ app.post('/api/export/session/:id/finalize', async (req, res) => {
         const cleanup = () => rmDirSafe(exportDir);
         stream.on('close', cleanup);
         stream.on('error', (err) => {
-            console.error('  [ERROR] Export stream failed:', err.message);
+            exportLogError(`Export stream failed: ${err.message}`);
             cleanup();
             if (!res.headersSent) res.status(500).json({ error: err.message });
             else res.end();
@@ -1358,7 +1370,7 @@ app.post('/api/export/session/:id/finalize', async (req, res) => {
         });
         stream.pipe(res);
     } catch (err) {
-        console.error('  [ERROR] WebM finalize failed:', err.message);
+        exportLogError(`WebM finalize failed: ${err.message}`);
         rmDirSafe(exportDir);
         if (!res.headersSent) {
             res.status(500).json({ error: err.message || 'Export failed' });
@@ -1400,7 +1412,7 @@ app.post(
     '/api/export/webm',
     (req, res, next) => {
         try {
-            req.exportDir = fs.mkdtempSync(path.join(os.tmpdir(), 'as-export-'));
+            req.exportDir = mkExportTemp(APP_DIR, 'as-export-').dir;
             next();
         } catch (err) {
             res.status(500).json({ error: `Failed to create temp dir: ${err.message}` });

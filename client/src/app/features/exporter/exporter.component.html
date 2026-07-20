@@ -42,6 +42,13 @@
                                 <div id="exCropOverlay" class="crop-overlay hidden">
                                     <div class="crop-region" id="exCropRegion"></div>
                                 </div>
+                                <div id="exCacheOverlay" class="canvas-loading-overlay hidden" aria-live="polite">
+                                    <div class="spinner" aria-hidden="true"></div>
+                                    <div class="cache-progress-text" id="exCacheStatus">Preparing scrub preview…</div>
+                                    <div class="cache-progress-hint" id="exCacheHint">
+                                        Building low-res scrub proxies — full keyed quality when you release the scrubber
+                                    </div>
+                                </div>
                             </div>
 
                             <!-- Frame Scrubber -->
@@ -51,8 +58,8 @@
                                     <button class="btn btn-sm btn-icon" id="exPlayBtn" title="Play/Pause">▶️</button>
                                     <button class="btn btn-sm btn-icon" id="exNextFrame" title="Next frame (→)">⏭</button>
                                 </div>
-                                <input type="range" id="exScrubber" min="0" max="100" value="0" title="Scrub through video frames">
-                                <span class="scrubber-info" id="exFrameInfo">0 / 0</span>
+                                <input type="range" id="exScrubber" min="0" max="100" value="0" title="Scrub through the export timeline (start–end, skip, reverse/ping-pong)">
+                                <span class="scrubber-info" id="exFrameInfo" title="Export frame · source frame">0 / 0</span>
                             </div>
 
                             <!-- Preview Modes -->

@@ -23,6 +23,71 @@ export type ChromaKeySettings = {
   smokeCleanup: boolean;
 };
 
+/** Defaults matching a fresh ChromaKey instance (and Export tab defaults). */
+export const CHROMA_KEY_DEFAULTS: ChromaKeySettings = {
+  keyR: 0,
+  keyG: 255,
+  keyB: 0,
+  similarity: 0.4,
+  smoothness: 0.08,
+  spillSuppression: 0.1,
+  postSaturation: 1,
+  postBrightness: 1,
+  edgeFadeWidth: 0,
+  antiAlias: false,
+  smokeCleanup: false,
+};
+
+function clampByte(n: number, fallback: number): number {
+  const x = Number(n);
+  if (!Number.isFinite(x)) return fallback;
+  return Math.max(0, Math.min(255, Math.round(x)));
+}
+
+/**
+ * Normalize settings from UI/JSON (string numbers, accidental percents, missing fields).
+ * similarity/smoothness/spill are 0–1 unit scales; values > 1 are treated as percents /100.
+ */
+export function normalizeChromaKeySettings(
+  s: Partial<ChromaKeySettings> | null | undefined
+): ChromaKeySettings {
+  const d = CHROMA_KEY_DEFAULTS;
+  const src = s && typeof s === 'object' ? s : {};
+
+  const unit = (v: unknown, fallback: number): number => {
+    let x = Number(v);
+    if (!Number.isFinite(x)) return fallback;
+    // Accidental percent payloads (e.g. similarity: 40 from a raw slider)
+    if (x > 1 && x <= 100) x = x / 100;
+    return Math.max(0, Math.min(1, x));
+  };
+
+  const postSat = Number(src.postSaturation);
+  const postBright = Number(src.postBrightness);
+
+  return {
+    keyR: clampByte(src.keyR as number, d.keyR),
+    keyG: clampByte(src.keyG as number, d.keyG),
+    keyB: clampByte(src.keyB as number, d.keyB),
+    similarity: unit(src.similarity, d.similarity),
+    smoothness: unit(src.smoothness, d.smoothness),
+    spillSuppression: unit(src.spillSuppression, d.spillSuppression),
+    // post sat/bright may be > 1 (boost); keep a sane range
+    postSaturation: Number.isFinite(postSat)
+      ? Math.max(0, Math.min(3, postSat))
+      : d.postSaturation,
+    postBrightness: Number.isFinite(postBright)
+      ? Math.max(0, Math.min(3, postBright))
+      : d.postBrightness,
+    edgeFadeWidth: Math.max(
+      0,
+      Math.min(512, Math.round(Number(src.edgeFadeWidth) || d.edgeFadeWidth))
+    ),
+    antiAlias: Boolean(src.antiAlias),
+    smokeCleanup: Boolean(src.smokeCleanup),
+  };
+}
+
 /** Shared pow(t, 1.5) LUT for t ∈ [0, 1]. */
 const POW15_LUT_SIZE = 1024;
 const POW15_LUT = new Float32Array(POW15_LUT_SIZE);
@@ -94,18 +159,33 @@ export class ChromaKey {
     };
   }
 
-  applySettings(s: ChromaKeySettings) {
-    this.keyR = s.keyR;
-    this.keyG = s.keyG;
-    this.keyB = s.keyB;
-    this.similarity = s.similarity;
-    this.smoothness = s.smoothness;
-    this.spillSuppression = s.spillSuppression;
-    this.postSaturation = s.postSaturation;
-    this.postBrightness = s.postBrightness;
-    this.edgeFadeWidth = s.edgeFadeWidth;
-    this.antiAlias = s.antiAlias;
-    this.smokeCleanup = s.smokeCleanup;
+  applySettings(s: Partial<ChromaKeySettings> | null | undefined) {
+    const n = normalizeChromaKeySettings({
+      // Merge over current instance so partial updates keep existing fields
+      keyR: this.keyR,
+      keyG: this.keyG,
+      keyB: this.keyB,
+      similarity: this.similarity,
+      smoothness: this.smoothness,
+      spillSuppression: this.spillSuppression,
+      postSaturation: this.postSaturation,
+      postBrightness: this.postBrightness,
+      edgeFadeWidth: this.edgeFadeWidth,
+      antiAlias: this.antiAlias,
+      smokeCleanup: this.smokeCleanup,
+      ...s,
+    });
+    this.keyR = n.keyR;
+    this.keyG = n.keyG;
+    this.keyB = n.keyB;
+    this.similarity = n.similarity;
+    this.smoothness = n.smoothness;
+    this.spillSuppression = n.spillSuppression;
+    this.postSaturation = n.postSaturation;
+    this.postBrightness = n.postBrightness;
+    this.edgeFadeWidth = n.edgeFadeWidth;
+    this.antiAlias = n.antiAlias;
+    this.smokeCleanup = n.smokeCleanup;
     this._updateKeyUV();
   }
 

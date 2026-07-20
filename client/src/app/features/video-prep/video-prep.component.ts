@@ -148,10 +148,16 @@ export class VideoPrepComponent implements AfterViewInit, OnDestroy {
   }
 
   private clearProxyCache(): void {
+    const frames = this.scrubCache;
     this.scrubCache = null;
     this.scrubCacheW = 0;
     this.scrubCacheH = 0;
     this.scrubCacheScale = 4;
+    // Drop shared bank only if it was ours (same frame array reference)
+    const shared = this.pipeline.videoScrubProxy();
+    if (shared && frames && shared.frames === frames) {
+      this.pipeline.setVideoScrubProxy(null);
+    }
   }
 
   /**
@@ -365,9 +371,10 @@ export class VideoPrepComponent implements AfterViewInit, OnDestroy {
     const dur = maxDuration || videoEl.duration || 1;
     const targetTime = Math.min(Math.max(0, time), Math.max(dur - 0.001, 0));
 
-    const waitSeeked = () =>
+    const waitSeeked = (ms = 900) =>
       new Promise<void>((resolve) => {
-        const timeout = setTimeout(resolve, 2000);
+        // Short timeout: EOF / same-time seeks often never fire `seeked`
+        const timeout = setTimeout(resolve, ms);
         videoEl.addEventListener(
           'seeked',
           () => {
@@ -379,6 +386,7 @@ export class VideoPrepComponent implements AfterViewInit, OnDestroy {
       });
 
     // Fast path: already there and caller doesn't need a fresh decode.
+    // Critical for scrub-cache fill of the last frames (all clamp to duration-ε).
     if (!force && Math.abs(videoEl.currentTime - targetTime) < 0.001 && !videoEl.seeking) {
       return;
     }
@@ -550,8 +558,38 @@ export class VideoPrepComponent implements AfterViewInit, OnDestroy {
       'success'
     );
 
-    // Background low-res scrub bank (smooth drag without multi-GB full-res cache).
-    void this.buildProxyCache(gen);
+    // Prefer shared bank from a prior Exporter visit, else build low-res scrub proxies.
+    if (!this.tryAdoptSharedScrubProxy()) {
+      void this.buildProxyCache(gen);
+    }
+  }
+
+  /** Reuse a *complete* shared proxy bank (Exporter may publish partial banks — ignore those). */
+  private tryAdoptSharedScrubProxy(): boolean {
+    const bank = this.pipeline.videoScrubProxy();
+    if (!bank?.frames?.length) return false;
+    const total = this.totalFrames();
+    if (bank.totalFrames !== total || bank.frames.length !== total) return false;
+    const filled = bank.frames.reduce((n, c) => n + (c ? 1 : 0), 0);
+    // Require nearly full bank — partial arrays paint blank while scrubbing
+    if (filled < Math.max(1, Math.floor(total * 0.95))) return false;
+    const src = this.pipeline.videoPrepSource();
+    const size = src?.blob?.size ?? 0;
+    const key = PipelineStateService.scrubProxyKey(
+      size,
+      total,
+      this.videoWidth(),
+      this.videoHeight()
+    );
+    // Allow match when blob size unknown on one side but dims/frames agree
+    if (bank.key !== key && size > 0 && !bank.key.startsWith('0:')) return false;
+    this.scrubCache = bank.frames;
+    this.scrubCacheScale = bank.scale;
+    this.scrubCacheW = bank.pw;
+    this.scrubCacheH = bank.ph;
+    this.cacheStatus.set('');
+    this.cachingProxy.set(false);
+    return true;
   }
 
   private drawFrameFromVideo(): void {
@@ -578,14 +616,29 @@ export class VideoPrepComponent implements AfterViewInit, OnDestroy {
   private paintProxyFrame(frameIdx: number): boolean {
     const proxy = this.scrubCache?.[frameIdx];
     const canvas = this.canvasRef?.nativeElement;
-    if (!proxy || !canvas) return false;
+    if (!proxy || !canvas || proxy.width < 1 || proxy.height < 1) return false;
     const ctx = canvas.getContext('2d')!;
     // Slight blur is fine while dragging; full-res lands on scrub end.
     ctx.imageSmoothingEnabled = true;
     ctx.imageSmoothingQuality = 'low';
+    // Solid fill first so we never flash an empty buffer if drawImage is a no-op
+    ctx.fillStyle = '#111';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
     ctx.drawImage(proxy, 0, 0, canvas.width, canvas.height);
     this.drawOnionSkin(ctx, canvas.width, canvas.height);
     return true;
+  }
+
+  /** Nearest non-null proxy index (for scrub fallbacks while the bank fills). */
+  private nearestProxyIndex(frameIdx: number): number {
+    const bank = this.scrubCache;
+    if (!bank?.length) return -1;
+    if (bank[frameIdx]) return frameIdx;
+    for (let d = 1; d < bank.length; d++) {
+      if (frameIdx - d >= 0 && bank[frameIdx - d]) return frameIdx - d;
+      if (frameIdx + d < bank.length && bank[frameIdx + d]) return frameIdx + d;
+    }
+    return -1;
   }
 
   /**
@@ -651,8 +704,11 @@ export class VideoPrepComponent implements AfterViewInit, OnDestroy {
     this.currentFrame.set(clamped);
     this.frameInfo.set(`Frame ${clamped} / ${Math.max(total - 1, 0)} (${time.toFixed(2)}s)`);
 
+    // Prefer exact proxy; else nearest neighbor so the canvas never goes blank mid-drag
     if (!this.paintProxyFrame(clamped)) {
-      // Proxy not ready yet — best-effort live seek (may be choppy until cache fills).
+      const near = this.nearestProxyIndex(clamped);
+      if (near >= 0) this.paintProxyFrame(near);
+      // Live seek only as last resort (choppy until bank fills)
       void this.seekToFrameAsync(clamped);
     }
 
@@ -725,6 +781,19 @@ export class VideoPrepComponent implements AfterViewInit, OnDestroy {
 
     this.cachingProxy.set(true);
     this.cacheStatus.set(`Building scrub preview (1/${scale})…`);
+
+    // Drop a partial bank left by Exporter so we never scrub on empty slots
+    try {
+      const shared = this.pipeline.videoScrubProxy();
+      if (shared?.frames?.length) {
+        const filled = shared.frames.reduce((n, c) => n + (c ? 1 : 0), 0);
+        if (filled < Math.floor(shared.frames.length * 0.95)) {
+          this.pipeline.setVideoScrubProxy(null);
+        }
+      }
+    } catch {
+      /* ignore */
+    }
 
     const stillActive = () =>
       gen === this.loadGeneration && this.video === video && this.videoLoaded();
@@ -820,15 +889,46 @@ export class VideoPrepComponent implements AfterViewInit, OnDestroy {
     if (!stillActive()) return;
 
     // ── Pass 2: seek-fill holes (bounded waits) ──
+    // Last few indices often map to the same clamped EOF time; browsers may not
+    // fire `seeked` when currentTime is unchanged → 2s timeout × N = hang.
     this.cacheStatus.set(`Filling scrub gaps (1/${scale})…`);
+    const maxT = Math.max(0, duration - 0.001);
+    let lastSeekTime = -1;
     for (let i = 0; i < total; i++) {
       if (!stillActive()) return;
       if (this.scrubCache![i]) continue;
-      const time = Math.min(i / fps, Math.max(duration - 0.001, 0));
-      await this.seekVideoAsync(video, time, duration);
+      // Mid-slot times match presentation better; clamp hard inside duration
+      const time = Math.min(Math.max(0, (i + 0.5) / fps), maxT);
+
+      if (
+        lastSeekTime >= 0 &&
+        Math.abs(time - lastSeekTime) < 0.0005 &&
+        !video.seeking &&
+        video.readyState >= 2
+      ) {
+        // Same decode as previous hole — clone capture without another seek
+        if (captureProxy(i)) unique++;
+        else if (i > 0 && this.scrubCache![i - 1]) {
+          this.scrubCache![i] = this.scrubCache![i - 1];
+          unique++;
+        }
+        continue;
+      }
+
+      try {
+        await this.seekVideoAsync(video, time, duration, false);
+      } catch {
+        /* continue with neighbor fill */
+      }
       if (!stillActive()) return;
+      lastSeekTime = video.currentTime;
       if (captureProxy(i)) unique++;
-      if (i % 6 === 0) {
+      else if (i > 0 && this.scrubCache![i - 1]) {
+        // Undecoded / failed draw — reuse neighbor so scrub never has a hole
+        this.scrubCache![i] = this.scrubCache![i - 1];
+        unique++;
+      }
+      if (i % 6 === 0 || i === total - 1) {
         this.cacheStatus.set(`Filling scrub gaps: ${unique} / ${total}`);
       }
     }
@@ -860,6 +960,25 @@ export class VideoPrepComponent implements AfterViewInit, OnDestroy {
     this.cachingProxy.set(false);
     this.cacheStatus.set('');
     const mb = ((pw * ph * 4 * total) / (1024 * 1024)).toFixed(1);
+
+    // Publish for Exporter (and re-entry to this tab) — unkeyed 1/N canvases.
+    try {
+      const src = this.pipeline.videoPrepSource();
+      const blobSize = src?.blob?.size ?? 0;
+      this.pipeline.setVideoScrubProxy({
+        key: PipelineStateService.scrubProxyKey(blobSize, total, vw, vh),
+        totalFrames: total,
+        videoWidth: vw,
+        videoHeight: vh,
+        scale,
+        pw,
+        ph,
+        frames: this.scrubCache!,
+      });
+    } catch {
+      /* ignore */
+    }
+
     this.toast.show(
       `Scrub preview ready (1/${scale}, ~${mb} MB) — full quality on release`,
       'success'

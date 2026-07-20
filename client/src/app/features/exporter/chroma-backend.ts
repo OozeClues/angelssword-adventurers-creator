@@ -150,37 +150,61 @@ export type CreateChromaProcessorOptions = {
  * hardware encoders (NVENC/QuickSync/VideoToolbox) do not support VP9/WebM with alpha.
  * Interactive scrub/preview uses a separate shared WebGPU session.
  */
-/** True when Settings → Export acceleration is CPU only. */
-export function isExportAccelCpuOnly(): boolean {
+/** Preview scrub: WebGPU disabled when Settings → Preview mode is CPU. */
+export function isPreviewAccelCpuOnly(): boolean {
   try {
-    return typeof localStorage !== 'undefined' && localStorage.getItem('as_export_accel') === 'cpu';
+    if (typeof localStorage === 'undefined') return false;
+    const p = localStorage.getItem('as_preview_accel');
+    if (p === 'cpu') return true;
+    if (p === 'auto') return false;
+    // legacy
+    return localStorage.getItem('as_export_accel') === 'cpu';
   } catch {
     return false;
   }
 }
 
+/** @deprecated use isPreviewAccelCpuOnly */
+export function isExportAccelCpuOnly(): boolean {
+  return isPreviewAccelCpuOnly();
+}
+
+export type ExportPipelineMode = 'cpu' | 'gpu';
+
+export function getExportPipelineMode(): ExportPipelineMode {
+  try {
+    if (typeof localStorage === 'undefined') return 'cpu';
+    const m = localStorage.getItem('as_export_mode');
+    if (m === 'gpu' || m === 'cpu') return m;
+  } catch {
+    /* ignore */
+  }
+  return 'cpu';
+}
+
 export async function createChromaProcessor(
   options: CreateChromaProcessorOptions = {}
 ): Promise<ChromaFrameProcessor> {
-  // User "CPU only" always wins over call-site prefer (engine used to pass prefer:'auto'
-  // and that overrode the setting).
-  const prefer: 'auto' | 'cpu' | 'webgpu' = isExportAccelCpuOnly()
-    ? 'cpu'
-    : (options.prefer ?? 'auto');
+  const pipeline = getExportPipelineMode();
+  // Export mode CPU → workers + PNG. Export mode GPU → WebGPU (else fall back to CPU).
+  let prefer: 'auto' | 'cpu' | 'webgpu' = pipeline === 'gpu' ? 'webgpu' : 'cpu';
+  if (options.prefer === 'cpu') prefer = 'cpu';
+  if (options.prefer === 'webgpu' && pipeline === 'gpu') prefer = 'webgpu';
 
   if (prefer === 'cpu') {
-    console.info('[chroma] using CPU worker backend (export; CPU-only mode or prefer=cpu)');
+    console.info('[chroma] using CPU worker backend (export mode=cpu)');
     return new CpuChromaProcessor();
   }
 
   if (prefer === 'webgpu' || prefer === 'auto') {
     try {
-      // Reuse the shared preview WebGPU session (one device for scrub + export keying).
       const { getSharedPreviewWebGpu } = await import('./chroma-webgpu');
-      const gpu = await getSharedPreviewWebGpu();
+      // Export GPU mode should still work even if preview is CPU-only:
+      // temporarily allow GPU by not checking preview flag inside getShared — 
+      // getShared checks as_export_accel legacy; update getShared to only use preview key.
+      const gpu = await getSharedPreviewWebGpu({ allowForExport: pipeline === 'gpu' });
       if (gpu) {
-        console.info('[chroma] using WebGPU backend (export keying + raw RGBA when possible)');
-        // Export's dispose() must not tear down the shared preview device.
+        console.info('[chroma] using WebGPU backend (export mode=gpu, raw RGBA)');
         return {
           backend: 'webgpu' as const,
           concurrency: Math.max(1, gpu.concurrency),
@@ -189,19 +213,17 @@ export async function createChromaProcessor(
           processToRawRgba: (imageData, settings) => gpu.processToRawRgba(imageData, settings),
           setRgbaEncoder: (fn) => gpu.setRgbaEncoder(fn),
           dispose: () => {
-            /* shared session — kept for interactive preview */
+            /* shared session */
           },
         };
       }
     } catch (err) {
       console.warn('[chroma] WebGPU init failed, falling back to CPU:', err);
     }
-    if (prefer === 'webgpu') {
-      console.warn('[chroma] WebGPU requested but unavailable; using CPU');
-    }
+    console.warn('[chroma] GPU export requested but WebGPU unavailable; using CPU PNG path');
   }
 
-  console.info('[chroma] using CPU worker backend (export)');
+  console.info('[chroma] using CPU worker backend (export fallback)');
   return new CpuChromaProcessor();
 }
 
@@ -276,34 +298,23 @@ export async function probeExportAcceleration(
   const run = (async (): Promise<ExportAccelProbe> => {
     const apiPresent =
       typeof navigator !== 'undefined' && !!(navigator as Navigator & { gpu?: GPU }).gpu;
-    const forcedCpu = isExportAccelCpuOnly();
-
-    if (forcedCpu) {
-      return {
-        backend: 'cpu',
-        label: 'CPU',
-        summary: 'CPU only (user setting)',
-        detail:
-          'Settings → Export acceleration is set to CPU only. Export uses multi-core workers + PNG; preview may still try WebGPU unless it fails.',
-        reason: 'User selected CPU only in Settings.',
-        stage: 'api',
-        apiPresent,
-      };
-    }
-
     try {
       const { diagnoseWebGpuChroma } = await import('./chroma-webgpu');
       const report = await diagnoseWebGpuChroma();
 
-      // Always dispose a successful device after the probe — export will create its own.
+      // Always dispose a successful device after the probe — live sessions re-acquire.
       report.processor?.dispose();
       report.processor = undefined;
 
       if (report.ok) {
         const who = [report.vendor, report.adapterName].filter(Boolean).join(' · ');
+        const previewCpu = isPreviewAccelCpuOnly();
         let detail =
-          'WebGPU is available: half-res scrub preview, export keying, and raw RGBA upload (skips PNG). ' +
-          'Transparent WebM packing still uses ffmpeg (VP9+alpha) — not NVENC.';
+          'WebGPU is available for GPU export and (when Preview mode is Auto) scrub keying. ' +
+          'Transparent WebM packing still uses ffmpeg (VP9+alpha).';
+        if (previewCpu) {
+          detail += ' Preview mode is CPU only — scrubbing will not use the GPU.';
+        }
         if (who) detail += ` Adapter: ${who}.`;
         if (report.parityMaxDelta != null) {
           detail += ` Smoke vs CPU: max |Δ|=${report.parityMaxDelta}, ${(report.parityMismatchPct ?? 0).toFixed(1)}% pixels differ slightly (expected).`;
@@ -311,7 +322,7 @@ export async function probeExportAcceleration(
         return {
           backend: 'webgpu',
           label: 'WebGPU',
-          summary: 'WebGPU ready (raw export path)',
+          summary: previewCpu ? 'WebGPU ready (preview forced CPU)' : 'WebGPU ready',
           detail,
           adapterName: report.adapterName,
           vendor: report.vendor,

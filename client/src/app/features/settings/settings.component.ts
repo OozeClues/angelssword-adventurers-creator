@@ -1,5 +1,4 @@
 import { Component, computed, inject, OnInit, signal } from '@angular/core';
-import { DecimalPipe } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { SettingsService } from '../../core/settings.service';
 import { ToastService } from '../../core/toast.service';
@@ -17,7 +16,7 @@ import {
 
 @Component({
   selector: 'app-settings',
-  imports: [FormsModule, UploadZoneComponent, DecimalPipe],
+  imports: [FormsModule, UploadZoneComponent],
   template: `
     <div class="settings-section settings-two-col">
       <div class="settings-col settings-col-left">
@@ -126,57 +125,80 @@ import {
 
       <div class="glass-panel">
         <div class="panel-title">
-          <span class="title-icon">⚡</span> Export acceleration
+          <span class="title-icon">⚡</span> Preview &amp; export
           @if (!accelChecking()) {
             <button
               type="button"
               class="btn btn-sm btn-secondary accel-refresh-btn"
-              title="Re-check WebGPU / CPU chroma backend"
+              title="Re-check WebGPU availability"
               (click)="refreshAccel()"
             >
-              ↻ Re-check
+              ↻ Re-check GPU
             </button>
           }
         </div>
         <div class="panel-subtitle">
-          <strong>Preview</strong> keys at half-res while scrubbing/playing (thumbnails cached), then
-          full-res on settle. <strong>Export (auto)</strong> uses WebGPU keying + raw RGBA frames when
-          available (skips PNG compress); otherwise CPU workers + PNG. Transparent WebM is always packed
-          with <strong>ffmpeg VP9+alpha</strong>.
+          Preview controls interactive scrubbing on the Export tab. Export mode chooses how Adventurer
+          WebM is keyed in the browser (CPU workers or WebGPU) before server ffmpeg packs the WebM.
         </div>
 
         <div class="form-row mt-1">
-          <label>Chroma acceleration</label>
-          <div class="mode-selector" role="group" aria-label="Export chroma acceleration">
+          <label>Preview mode</label>
+          <div class="mode-selector" role="group" aria-label="Preview chroma mode">
             <button
               type="button"
               class="mode-btn"
-              [class.active]="settings.exportAccelMode() === 'auto'"
-              title="Use WebGPU when available for export keying and raw frames"
-              (click)="setExportAccel('auto')"
+              [class.active]="settings.previewAccelMode() === 'auto'"
+              title="Use WebGPU for half-res scrub keying when available"
+              (click)="setPreviewAccel('auto')"
             >
               Auto (WebGPU)
             </button>
             <button
               type="button"
               class="mode-btn"
-              [class.active]="settings.exportAccelMode() === 'cpu'"
-              title="Force multi-core CPU workers + PNG only (safe fallback)"
-              (click)="setExportAccel('cpu')"
+              [class.active]="settings.previewAccelMode() === 'cpu'"
+              title="Force CPU chroma for scrubbing / preview"
+              (click)="setPreviewAccel('cpu')"
             >
               CPU only
             </button>
           </div>
+        </div>
+
+        <div class="form-row mt-1">
+          <label>Export mode (Adventurer WebM)</label>
+          <div class="mode-selector" role="group" aria-label="Export pipeline mode">
+            <button
+              type="button"
+              class="mode-btn"
+              [class.active]="settings.exportPipelineMode() === 'cpu'"
+              title="Known-good: browser workers + PNG frames + server ffmpeg"
+              (click)="setExportPipeline('cpu')"
+            >
+              CPU
+            </button>
+            <button
+              type="button"
+              class="mode-btn"
+              [class.active]="settings.exportPipelineMode() === 'gpu'"
+              [disabled]="!webgpuExportAvailable()"
+              title="Browser WebGPU key + raw RGBA upload + server ffmpeg"
+              (click)="setExportPipeline('gpu')"
+            >
+              GPU
+            </button>
+          </div>
           <div class="text-dim mt-1" style="font-size: 0.75rem">
-            Choose <strong>CPU only</strong> if GPU keying glitches, crashes, or is slower on your drivers.
-            Preview still falls back to CPU automatically when WebGPU is missing.
+            <strong>CPU</strong> — reliable browser workers + PNG frames + server ffmpeg.
+            <strong>GPU</strong> — WebGPU keying + raw frames (disabled if WebGPU unavailable).
           </div>
         </div>
 
         <div
           class="accel-badge accel-badge-panel"
-          [class.accel-webgpu]="accel()?.backend === 'webgpu'"
-          [class.accel-cpu]="accel()?.backend === 'cpu'"
+          [class.accel-webgpu]="accel()?.backend === 'webgpu' && settings.previewAccelMode() !== 'cpu'"
+          [class.accel-cpu]="accel()?.backend === 'cpu' || settings.previewAccelMode() === 'cpu'"
           [class.accel-checking]="accelChecking()"
           role="status"
           aria-live="polite"
@@ -184,7 +206,7 @@ import {
           <span class="accel-icon" aria-hidden="true">
             @if (accelChecking()) {
               ⏳
-            } @else if (accel()?.backend === 'webgpu') {
+            } @else if (accel()?.backend === 'webgpu' && settings.previewAccelMode() !== 'cpu') {
               ⚡
             } @else {
               🖥️
@@ -192,7 +214,7 @@ import {
           </span>
           <div class="accel-text">
             <div class="accel-title-row">
-              <span class="accel-label">Export chroma</span>
+              <span class="accel-label">WebGPU status</span>
               <span class="accel-pill">
                 @if (accelChecking()) {
                   Checking…
@@ -206,7 +228,7 @@ import {
             </div>
             <div class="accel-summary">
               @if (accelChecking()) {
-                Probing WebGPU (API → adapter → device → shaders → smoke)…
+                Probing WebGPU…
               } @else if (accel()?.backend === 'webgpu') {
                 {{ accel()!.summary }}
                 @if (accelAdapterLine()) {
@@ -220,7 +242,7 @@ import {
               <div class="accel-detail">{{ accel()!.detail }}</div>
               @if (accel()?.reason) {
                 <div class="accel-fail-reason">
-                  <strong>Why not WebGPU:</strong> {{ accel()!.reason }}
+                  <strong>Note:</strong> {{ accel()!.reason }}
                 </div>
               }
               <ul class="accel-diag">
@@ -237,18 +259,13 @@ import {
                   </span>
                 </li>
                 <li>
-                  <span class="diag-k">Init stage</span>
-                  <span class="diag-v">{{ accel()!.stage || '—' }}</span>
+                  <span class="diag-k">Export mode</span>
+                  <span class="diag-v">{{ settings.exportPipelineMode() }}</span>
                 </li>
-                @if (accel()!.parityMaxDelta != null) {
-                  <li>
-                    <span class="diag-k">Smoke vs CPU</span>
-                    <span class="diag-v">
-                      max |Δ|={{ accel()!.parityMaxDelta }},
-                      {{ (accel()!.parityMismatchPct ?? 0) | number: '1.1-1' }}% pixels
-                    </span>
-                  </li>
-                }
+                <li>
+                  <span class="diag-k">Preview mode</span>
+                  <span class="diag-v">{{ settings.previewAccelMode() }}</span>
+                </li>
               </ul>
             }
           </div>
@@ -1270,16 +1287,38 @@ export class SettingsComponent implements OnInit {
     );
   }
 
-  setExportAccel(mode: 'auto' | 'cpu'): void {
-    this.settings.setExportAccelMode(mode);
+  /** Whether GPU export mode can be selected (WebGPU probe succeeded). */
+  readonly webgpuExportAvailable = computed(() => {
+    if (this.accelChecking()) return false;
+    const a = this.accel();
+    return !!a && a.backend === 'webgpu' && a.stage === 'ready';
+  });
+
+  setPreviewAccel(mode: 'auto' | 'cpu'): void {
+    this.settings.setPreviewAccelMode(mode);
     this.toast.show(
-      mode === 'cpu'
-        ? 'WebGPU disabled — export & preview use CPU only'
-        : 'Auto mode — WebGPU used when available',
+      mode === 'cpu' ? 'Preview mode: CPU only' : 'Preview mode: Auto (WebGPU when available)',
       mode === 'cpu' ? 'warning' : 'info'
     );
-    // Re-probe so the badge reflects the user's choice immediately.
     void this.loadAccel(true);
+  }
+
+  setExportPipeline(mode: 'cpu' | 'gpu'): void {
+    if (mode === 'gpu' && !this.webgpuExportAvailable()) {
+      this.toast.show('WebGPU is not available — use CPU export', 'warning');
+      return;
+    }
+    this.settings.setExportPipelineMode(mode);
+    const labels: Record<'cpu' | 'gpu', string> = {
+      cpu: 'CPU (PNG + workers + ffmpeg)',
+      gpu: 'GPU (WebGPU key + raw + ffmpeg)',
+    };
+    this.toast.show(`Export mode: ${labels[mode]}`, 'info');
+  }
+
+  /** @deprecated */
+  setExportAccel(mode: 'auto' | 'cpu'): void {
+    this.setPreviewAccel(mode);
   }
 
   saveOpenAI(): void {
