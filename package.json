@@ -4,7 +4,7 @@
   "description": "⚔️ AS Adventurer — VTuber Creation Pipeline by Angel's Sword Studios",
   "main": "server.js",
   "scripts": {
-    "start": "node scripts/ensure-ffmpeg.js --quiet; node server.js",
+    "start": "node server.js",
     "build": "npm run build --prefix client",
     "build:release": "node build-exe.js",
     "build:exe": "node build-exe.js --target win-x64",
@@ -21,7 +21,7 @@
     "build:all:flatpak": "node build-exe.js --target all-flatpak",
     "ensure-ffmpeg": "node scripts/ensure-ffmpeg.js --copy",
     "dev:client": "npm start --prefix client",
-    "dev:server": "node scripts/ensure-ffmpeg.js --quiet; node server.js",
+    "dev:server": "node server.js",
     "postinstall": "npm install --prefix client || true"
   },
   "dependencies": {
@@ -41,7 +41,9 @@
   "pkg": {
     "scripts": [
       "server.js",
-      "comfy/**/*.js"
+      "comfy/**/*.js",
+      "lib/**/*.cjs",
+      "lib/**/*.js"
     ],
     "targets": ["node18-win-x64"],
     "outputPath": "dist"

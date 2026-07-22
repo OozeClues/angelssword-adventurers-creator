@@ -35,8 +35,10 @@ modules:
     build-commands:
       - install -d /app/lib/as-adventurer/bin
       - install -Dm755 ASAdventurer /app/lib/as-adventurer/ASAdventurer
-      - install -Dm755 bin/ffmpeg /app/lib/as-adventurer/bin/ffmpeg
       - |
+        if [ -f bin/ffmpeg ]; then
+          install -Dm755 bin/ffmpeg /app/lib/as-adventurer/bin/ffmpeg
+        fi
         if [ -f bin/ffmpeg.LICENSE ]; then
           install -Dm644 bin/ffmpeg.LICENSE /app/lib/as-adventurer/bin/ffmpeg.LICENSE
         fi

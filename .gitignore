@@ -5,3 +5,19 @@ backup/
 *.log
 *.lnk
 tmp-export/
+
+# Managed ffmpeg (downloaded by ensure-ffmpeg / server startup — never commit)
+bin/ffmpeg
+bin/ffmpeg.exe
+bin/ffmpeg.version
+bin/ffmpeg.exe.version
+bin/ffmpeg.LICENSE
+bin/ffmpeg*.old
+bin/ffmpeg*.new
+bin/ffmpeg*.download
+
+# Accidental CWD stubs (relative path "ffmpeg" written from tests / PATH probes)
+/ffmpeg
+/ffmpeg.exe
+/ffmpeg.version
+/ffmpeg.exe.version

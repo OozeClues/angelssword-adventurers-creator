@@ -2,6 +2,8 @@
 
 AS Adventurer Creator ships as a **local Node server + browser UI**. The Flatpak wraps the same Linux release binary produced by `build-exe.js`.
 
+**ffmpeg** is not required inside the Flatpak image: on first use the app downloads a platform static build into the user cache (network is already granted). Optional air-gapped builds can pass `--bundle-ffmpeg` to `build-exe.js` before packaging.
+
 For product overview, AI providers (including Grok / SuperGrok), and end-user usage, see the [root README](../README.md).
 
 ## Prerequisites (Linux build host)

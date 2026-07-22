@@ -26,6 +26,10 @@
  *   node build-exe.js --target all-flatpak          # all ZIPs + both Flatpaks
  *   node build-exe.js --skip-client-build
  *   node build-exe.js --target linux-flatpak --flatpak-only  # reuse existing linux folder
+ *   node build-exe.js --bundle-ffmpeg   # optional: ship bin/ffmpeg for air-gapped use
+ *
+ * Releases do NOT include ffmpeg by default. The app downloads the latest
+ * (or LTS pin) static build on first run / when a managed install is stale.
  *
  * Aliases: win→win-x64, mac→mac-x64, linux→linux-x64,
  *          apple-silicon|as|m1|m2→mac-arm64, flatpak→linux-flatpak,
@@ -194,7 +198,12 @@ function parseArgs() {
   let key = 'win-x64';
   let skipClient = false;
   let flatpakOnly = false;
+  let bundleFfmpeg = false;
   for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === '--bundle-ffmpeg') {
+      bundleFfmpeg = true;
+      continue;
+    }
     if (argv[i] === '--target' && argv[i + 1]) {
       const raw = String(argv[++i]).toLowerCase();
       key = TARGET_ALIASES[raw] || raw;
@@ -210,6 +219,7 @@ function parseArgs() {
       targetKey: key,
       skipClient,
       flatpakOnly,
+      bundleFfmpeg,
       flatpak: null,
       buildAll: true,
       withFlatpaks: key === 'all-flatpak',
@@ -221,6 +231,7 @@ function parseArgs() {
       targetKey: key,
       skipClient,
       flatpakOnly,
+      bundleFfmpeg,
       flatpak: FLATPAK_TARGETS[key],
       buildAll: false,
       withFlatpaks: false,
@@ -243,6 +254,7 @@ function parseArgs() {
   return {
     target: TARGETS[key],
     targetKey: key,
+    bundleFfmpeg,
     skipClient,
     flatpakOnly,
     flatpak: null,
@@ -288,7 +300,6 @@ function bundleFfmpeg(binDest, target) {
 
   const localCandidates = [
     path.join(ROOT, 'bin', target.ffmpegName),
-    path.join(ROOT, target.ffmpegName),
     path.join(ROOT, 'node_modules', 'ffmpeg-static', target.ffmpegName),
   ];
   const local = localCandidates.find((p) => fs.existsSync(p));
@@ -336,16 +347,15 @@ function unixStartBody(binaryName) {
 set +e
 DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$DIR" || exit 1
-chmod +x "$DIR/${binaryName}" "$DIR/bin/ffmpeg" \\
+chmod +x "$DIR/${binaryName}" \\
   "$DIR/Start AS Adventurer.sh" "$DIR/Start AS Adventurer.command" \\
   "$DIR/First Run Setup.sh" "$DIR/First Run Setup.command" 2>/dev/null
+[[ -x "$DIR/bin/ffmpeg" ]] && chmod +x "$DIR/bin/ffmpeg" 2>/dev/null
 echo ""
 echo "  AS Adventurer Creator — Angel's Sword Studios"
 echo "  Starting... leave this window open. Ctrl+C to stop."
+echo "  First run may download ffmpeg (~30–80 MB) for transparent WebM export."
 echo ""
-if [[ ! -f "$DIR/bin/ffmpeg" ]]; then
-  echo "  [WARN] bin/ffmpeg missing — transparent WebM export may fail."
-fi
 (sleep 1.5; command -v open >/dev/null 2>&1 && open "http://localhost:3001") &
 (sleep 1.5; command -v xdg-open >/dev/null 2>&1 && xdg-open "http://localhost:3001") &
 exec "$DIR/${binaryName}"
@@ -360,9 +370,10 @@ cd "$DIR" || exit 1
 echo ""
 echo "  AS Adventurer — First Run Setup"
 echo ""
-chmod +x "$DIR/${binaryName}" "$DIR/bin/ffmpeg" \\
+chmod +x "$DIR/${binaryName}" \\
   "$DIR/Start AS Adventurer.sh" "$DIR/Start AS Adventurer.command" \\
   "$DIR/First Run Setup.sh" "$DIR/First Run Setup.command" 2>/dev/null
+[[ -x "$DIR/bin/ffmpeg" ]] && chmod +x "$DIR/bin/ffmpeg" 2>/dev/null
 echo "  ✓ Execute permissions set"
 if [[ "$(uname -s)" == "Linux" ]] || command -v xdg-open >/dev/null 2>&1; then
   DESKTOP_FILE="$DIR/Start AS Adventurer.desktop"
@@ -401,8 +412,8 @@ cd /d "%~dp0"
 echo.
 echo  AS Adventurer Creator — Angel's Sword Studios
 echo  Starting... leave this window open. Ctrl+C to stop.
+echo  First run may download ffmpeg (~30-80 MB) for transparent WebM export.
 echo.
-if not exist "bin\\ffmpeg.exe" echo  [WARN] bin\\ffmpeg.exe missing — WebM alpha export may fail.
 start "" http://localhost:3001
 "${binaryName}"
 if errorlevel 1 (
@@ -425,8 +436,14 @@ function writeUnixLaunchers(dist, binaryName) {
   writeExecutable(path.join(dist, 'setup.sh'), setup);
 }
 
-function writeEndUserReadme(dist, target) {
-  const includes = `Includes: ${target.binary}, bin/${target.ffmpegName}, www/\n`;
+function writeEndUserReadme(dist, target, opts = {}) {
+  const bundled = !!opts.bundleFfmpeg;
+  const includes = bundled
+    ? `Includes: ${target.binary}, bin/${target.ffmpegName}, www/\n`
+    : `Includes: ${target.binary}, www/\n` +
+      `ffmpeg: downloaded automatically on first run (transparent WebM).\n` +
+      `  Offline: place ${target.ffmpegName} in a bin/ folder next to the app,\n` +
+      `  or set FFMPEG_PATH to an existing ffmpeg.\n`;
   let text;
   if (target.ffmpegPlatform === 'win32') {
     text = `AS Adventurer Creator — no install needed
@@ -434,7 +451,7 @@ function writeEndUserReadme(dist, target) {
 1. Unzip anywhere
 2. Double-click Start AS Adventurer.bat
 3. Keep the console open while you work
-
+${bundled ? '' : '4. First launch may download ffmpeg (~30–80 MB, needs network once)\n'}
 ${includes}`;
   } else if (target.ffmpegPlatform === 'darwin') {
     text = `AS Adventurer Creator — no install needed (macOS)
@@ -445,7 +462,7 @@ ${includes}`;
 3. Double-click Start AS Adventurer.command
 4. Your browser opens to http://localhost:3001
    (open that URL manually if it does not)
-
+${bundled ? '' : '5. First launch may download ffmpeg (~30–80 MB, needs network once)\n'}
 Keep the terminal window open while you work.
 
 ${includes}`;
@@ -459,7 +476,7 @@ ${includes}`;
 3. Start with Start AS Adventurer.sh (or the .desktop launcher if present)
 4. Your browser opens to http://localhost:3001
    (open that URL manually if it does not)
-
+${bundled ? '' : '5. First launch may download ffmpeg (~30–80 MB, needs network once)\n'}
 Keep the terminal open while you work.
 
 ${includes}`;
@@ -617,8 +634,10 @@ modules:
     build-commands:
       - install -d /app/lib/as-adventurer/bin
       - install -Dm755 ASAdventurer /app/lib/as-adventurer/ASAdventurer
-      - install -Dm755 bin/ffmpeg /app/lib/as-adventurer/bin/ffmpeg
       - |
+        if [ -f bin/ffmpeg ]; then
+          install -Dm755 bin/ffmpeg /app/lib/as-adventurer/bin/ffmpeg
+        fi
         if [ -f bin/ffmpeg.LICENSE ]; then
           install -Dm644 bin/ffmpeg.LICENSE /app/lib/as-adventurer/bin/ffmpeg.LICENSE
         fi
@@ -1004,10 +1023,11 @@ function ensurePkg() {
  * Build a single platform release into dist/<folder>/ + ZIP.
  * @param {object} target - TARGETS entry
  * @param {string} targetKey
- * @param {{ skipClient?: boolean, quietFooter?: boolean }} opts
+ * @param {{ skipClient?: boolean, quietFooter?: boolean, bundleFfmpeg?: boolean }} opts
  */
 function buildZipRelease(target, targetKey, opts = {}) {
   const skipClient = !!opts.skipClient;
+  const doBundleFfmpeg = !!opts.bundleFfmpeg;
   const DIST = path.join(DIST_ROOT, target.folder);
 
   console.log();
@@ -1076,13 +1096,17 @@ function buildZipRelease(target, targetKey, opts = {}) {
   log('Copying UI → www/…');
   copyDirSync(uiRoot, path.join(DIST, 'www'));
 
-  // 4. ffmpeg
-  log('Bundling ffmpeg…');
-  try {
-    bundleFfmpeg(path.join(DIST, 'bin'), target);
-  } catch (e) {
-    console.error('  ❌ ffmpeg bundle failed:', e.message);
-    process.exit(1);
+  // 4. ffmpeg (optional — default: download at runtime on first launch)
+  if (doBundleFfmpeg) {
+    log('Bundling ffmpeg (--bundle-ffmpeg)…');
+    try {
+      bundleFfmpeg(path.join(DIST, 'bin'), target);
+    } catch (e) {
+      console.error('  ❌ ffmpeg bundle failed:', e.message);
+      process.exit(1);
+    }
+  } else {
+    log('Skipping ffmpeg bundle (app downloads latest/LTS on first run)');
   }
 
   // 5. Launchers
@@ -1092,7 +1116,7 @@ function buildZipRelease(target, targetKey, opts = {}) {
   } else {
     writeUnixLaunchers(DIST, target.binary);
   }
-  writeEndUserReadme(DIST, target);
+  writeEndUserReadme(DIST, target, { bundleFfmpeg: doBundleFfmpeg });
 
   // 6. ZIP
   const zipPath = path.join(DIST_ROOT, target.zipName);
@@ -1139,7 +1163,8 @@ function buildZipRelease(target, targetKey, opts = {}) {
   console.log();
   log(`Folder: ${DIST}`);
   log(`  ${target.binary}`);
-  log(`  bin/${target.ffmpegName}`);
+  if (doBundleFfmpeg) log(`  bin/${target.ffmpegName}`);
+  else log('  (ffmpeg: auto-download on first run — not shipped)');
   log('  www/');
   log(
     target.ffmpegPlatform === 'win32'
@@ -1167,7 +1192,7 @@ function buildZipRelease(target, targetKey, opts = {}) {
  * Build every OS/arch ZIP (and optionally both Flatpaks).
  * Client SPA is built once; subsequent targets reuse it.
  */
-function buildAllReleases(skipClient, withFlatpaks) {
+function buildAllReleases(skipClient, withFlatpaks, bundleFfmpegFlag) {
   console.log();
   console.log('  ============================================');
   console.log('   ⚔️  AS Adventurer — Build ALL Releases');
@@ -1194,6 +1219,7 @@ function buildAllReleases(skipClient, withFlatpaks) {
       skipClient: true,
       clientAlreadyBuilt: true,
       quietFooter: true,
+      bundleFfmpeg: !!bundleFfmpegFlag,
     });
   }
 
@@ -1242,10 +1268,19 @@ function buildAllReleases(skipClient, withFlatpaks) {
 }
 
 // ── Main ─────────────────────────────────────────
-const { target, targetKey, skipClient, flatpakOnly, flatpak, buildAll, withFlatpaks } = parseArgs();
+const {
+  target,
+  targetKey,
+  skipClient,
+  flatpakOnly,
+  flatpak,
+  buildAll,
+  withFlatpaks,
+  bundleFfmpeg: bundleFfmpegFlag,
+} = parseArgs();
 
 if (buildAll) {
-  buildAllReleases(skipClient, withFlatpaks);
+  buildAllReleases(skipClient, withFlatpaks, bundleFfmpegFlag);
   process.exit(0);
 }
 
@@ -1254,4 +1289,4 @@ if (flatpak) {
   process.exit(0);
 }
 
-buildZipRelease(target, targetKey, { skipClient });
+buildZipRelease(target, targetKey, { skipClient, bundleFfmpeg: bundleFfmpegFlag });

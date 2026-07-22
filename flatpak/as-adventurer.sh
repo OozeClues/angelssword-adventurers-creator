@@ -12,8 +12,9 @@ echo "  Starting… leave this window open. Ctrl+C to stop."
 echo "  UI: http://localhost:3001"
 echo ""
 
+# ffmpeg is downloaded on first run into the user cache when not bundled.
 if [[ ! -x "$APP_ROOT/bin/ffmpeg" ]]; then
-  echo "  [WARN] bin/ffmpeg missing — transparent WebM export may fail."
+  echo "  ffmpeg: not bundled — app will download on first use if needed."
 fi
 
 # Prefer the portal-backed host browser (Flatpak sandbox).

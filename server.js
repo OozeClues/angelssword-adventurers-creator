@@ -21,6 +21,11 @@ const crypto = require('crypto');
 const { exec, execFile, spawn } = require('child_process');
 const comfy = require('./comfy');
 const { mkExportTemp } = require('./lib/export-temp.cjs');
+const {
+    ensureFfmpeg,
+    resolveFfmpegPathSync,
+    probeVersionLine,
+} = require('./lib/ensure-ffmpeg.cjs');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -902,37 +907,44 @@ app.post('/api/xai/fetch-url', async (req, res) => {
 
 const FFMPEG_MAX_FRAMES = 2000;
 
+/** Cached path after ensureFfmpeg (startup or first export). */
+let cachedFfmpegPath = null;
+let ensureFfmpegPromise = null;
+
 /**
- * Locate ffmpeg for transparent WebM export.
- * Prefer a bundled binary (bin/ next to the app, or ffmpeg-static from npm)
- * so end users do not need a system install.
+ * Locate ffmpeg for transparent WebM export (no network).
+ * Prefer managed bin/ next to the app or user cache, then ffmpeg-static (dev), then PATH.
  */
 function resolveFfmpegPath() {
-    if (process.env.FFMPEG_PATH && fs.existsSync(process.env.FFMPEG_PATH)) {
-        return process.env.FFMPEG_PATH;
-    }
+    if (cachedFfmpegPath) return cachedFfmpegPath;
+    return resolveFfmpegPathSync(APP_DIR);
+}
 
-    const binName = process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg';
-    const candidates = [
-        path.join(APP_DIR, 'bin', binName),
-        path.join(APP_DIR, binName),
-    ];
-    for (const c of candidates) {
-        if (fs.existsSync(c)) return c;
+/**
+ * Ensure a current ffmpeg is present (download / upgrade if needed).
+ * Safe to call multiple times; concurrent callers share one promise.
+ */
+function ensureFfmpegReady(opts = {}) {
+    if (!ensureFfmpegPromise) {
+        ensureFfmpegPromise = ensureFfmpeg({
+            appDir: APP_DIR,
+            quiet: opts.quiet !== false,
+        })
+            .then((result) => {
+                if (result.path) {
+                    cachedFfmpegPath = result.path;
+                } else {
+                    // Allow a later export to retry download
+                    ensureFfmpegPromise = null;
+                }
+                return result;
+            })
+            .catch((err) => {
+                ensureFfmpegPromise = null;
+                throw err;
+            });
     }
-
-    // npm dependency (node server.js / dev). Skip under pkg — snapshot paths
-    // are not valid spawn targets; the EXE build copies the binary to bin/.
-    if (!process.pkg) {
-        try {
-            const staticPath = require('ffmpeg-static');
-            if (staticPath && fs.existsSync(staticPath)) return staticPath;
-        } catch (_) {
-            /* optional */
-        }
-    }
-
-    return 'ffmpeg'; // last resort: system PATH
+    return ensureFfmpegPromise;
 }
 
 function probeFfmpeg() {
@@ -947,6 +959,22 @@ function probeFfmpeg() {
             resolve({ available: true, path: ffmpegPath, version: firstLine.trim() });
         });
     });
+}
+
+/** Probe, and if missing try one ensure/download pass. */
+async function probeFfmpegOrEnsure() {
+    let probe = await probeFfmpeg();
+    if (probe.available) return probe;
+    try {
+        const result = await ensureFfmpegReady({ quiet: false });
+        if (result.path) {
+            cachedFfmpegPath = result.path;
+            probe = await probeFfmpeg();
+        }
+    } catch (_) {
+        /* keep original probe */
+    }
+    return probe;
 }
 
 function rmDirSafe(dir) {
@@ -979,7 +1007,7 @@ function runFfmpeg(ffmpegPath, args, cwd) {
 
 app.get('/api/export/status', async (_req, res) => {
     try {
-        const probe = await probeFfmpeg();
+        const probe = await probeFfmpegOrEnsure();
         res.json({
             ffmpeg: probe.available,
             path: probe.path,
@@ -1216,11 +1244,11 @@ function encodeWebmFromDir(exportDir, frameCount, fps) {
 
 app.post('/api/export/session', async (req, res) => {
     try {
-        const probe = await probeFfmpeg();
+        const probe = await probeFfmpegOrEnsure();
         if (!probe.available) {
             return res.status(503).json({
                 error:
-                    'ffmpeg not found. Install ffmpeg (PATH or bin/ next to the app) for transparent WebM export.',
+                    'ffmpeg not found. The app will try to download it on startup; check network, or place ffmpeg in bin/ next to the app, set FFMPEG_PATH, or run: npm run ensure-ffmpeg',
                 path: probe.path,
             });
         }
@@ -1430,7 +1458,7 @@ app.post(
     async (req, res) => {
         const exportDir = req.exportDir;
         try {
-            const probe = await probeFfmpeg();
+            const probe = await probeFfmpegOrEnsure();
             if (!probe.available) {
                 rmDirSafe(exportDir);
                 return res.status(503).json({
@@ -1506,17 +1534,33 @@ app.listen(PORT, () => {
     console.log(`  Server running at http://localhost:${PORT}`);
     console.log(`  Static root: ${staticRoot || '(none — build client/dist or use www/)'}`);
 
-    probeFfmpeg().then((p) => {
-        if (p.available) {
-            console.log(`  ffmpeg: ready (${p.path})`);
-        } else {
-            console.log('  ffmpeg: NOT FOUND — transparent WebM export unavailable');
-            console.log('           Bundled releases need bin/ffmpeg(.exe) next to the app');
-            console.log('           Dev: npm run ensure-ffmpeg');
-        }
-        console.log('  Press Ctrl+C to stop');
-        console.log('');
-    });
+    // Auto-download / upgrade managed ffmpeg (not bundled in releases).
+    ensureFfmpegReady({ quiet: false })
+        .then((result) => {
+            if (result.path) {
+                const ver =
+                    result.version ||
+                    probeVersionLine(result.path) ||
+                    '';
+                const tag = result.releaseTag ? ` [${result.releaseTag}]` : '';
+                console.log(`  ffmpeg: ready (${result.source}) ${result.path}${tag}`);
+                if (ver) console.log(`           ${ver}`);
+            } else {
+                console.log('  ffmpeg: NOT FOUND — transparent WebM export unavailable');
+                console.log('           First launch downloads a platform build (needs network once).');
+                console.log('           Or set FFMPEG_PATH / place bin/ffmpeg next to the app.');
+                if (!process.pkg) {
+                    console.log('           Dev: npm run ensure-ffmpeg');
+                }
+            }
+            console.log('  Press Ctrl+C to stop');
+            console.log('');
+        })
+        .catch((err) => {
+            console.log('  ffmpeg: ensure failed —', err.message);
+            console.log('  Press Ctrl+C to stop');
+            console.log('');
+        });
 
     // Auto-open browser (skip in dev dual-stack / Flatpak)
     if (process.env.SKIP_BROWSER === '1') return;

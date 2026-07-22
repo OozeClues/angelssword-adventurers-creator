@@ -50,6 +50,7 @@ if not exist "node_modules\" (
 
 echo.
 echo   Starting server...
+echo   (ffmpeg is ensured automatically on startup for WebM export)
 echo   (Press Ctrl+C to stop)
 echo.
 node server.js

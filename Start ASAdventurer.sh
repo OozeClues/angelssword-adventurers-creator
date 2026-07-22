@@ -36,16 +36,8 @@ if [[ ! -d node_modules ]]; then
 fi
 
 echo ""
-echo "  Ensuring ffmpeg is available (transparent WebM export)..."
-if ! node scripts/ensure-ffmpeg.js --quiet; then
-  echo "  [WARN] ffmpeg could not be installed automatically."
-  echo "  Transparent WebM export may be unavailable."
-  echo "  GIF export still works. Re-run: npm install"
-  echo ""
-fi
-
-echo ""
 echo "  Starting server..."
+echo "  (ffmpeg is ensured automatically on startup for WebM export)"
 echo "  (Press Ctrl+C to stop)"
 echo ""
 exec node server.js

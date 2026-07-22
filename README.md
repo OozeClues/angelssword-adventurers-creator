@@ -50,7 +50,13 @@ AS Adventurer walks you through a **4-step pipeline**:
 git clone https://github.com/OozeClues/angelssword-adventurers-creator.git
 cd angelssword-adventurers-creator
 npm install          # also installs client/ deps
-npm start            # API + built UI on http://localhost:3001
+npm start            # ensures ffmpeg, then API + built UI on http://localhost:3001
+```
+
+`npm start` (and the packaged app) **auto-download the latest/LTS static ffmpeg** when missing or stale, into `bin/` (or a user cache if the app dir is not writable). One-click without starting the server:
+
+```bash
+npm run ensure-ffmpeg
 ```
 
 **Angular UI development** (hot reload):
@@ -61,10 +67,12 @@ npm run dev:client   # API on 3002, ng serve on 3001 (proxies /api)
 
 See [client/README.md](client/README.md) for Angular-only details.
 
-**Optional port:**
+**Optional port / ffmpeg pin:**
 
 ```bash
 PORT=3080 npm start
+FFMPEG_BINARY_RELEASE=b6.1.1 npm start   # pin a release tag (skip GitHub “latest”)
+FFMPEG_PATH=/usr/bin/ffmpeg npm start    # use a system binary as-is
 ```
 
 ---
@@ -186,7 +194,7 @@ This repository is based on [AngelsSwordStudios/angelssword-adventurers-creator]
 ### Packaging & platforms
 
 - Multi-target packaging via `build-exe.js`: **Windows** (x64/arm64), **macOS** (x64/arm64), **Linux** (x64/arm64), **Flatpak**
-- Bundled **ffmpeg** for transparent WebM export
+- **ffmpeg** auto-downloaded on first run (latest/LTS static build); optional `--bundle-ffmpeg` for air-gapped releases
 
 ### Other
 
@@ -214,9 +222,9 @@ WebM with alpha also works in OBS browser sources and similar tools.
 | ------------ | ---------------------------------------------------------------- |
 | **OS**       | Windows 10/11, macOS, or Linux (x64 or arm64 depending on build) |
 | **Browser**  | Chrome, Edge, or Firefox                                         |
-| **Internet** | Only for AI steps (① generate / ② video). ③–④ offline            |
+| **Internet** | AI steps (①–②); first-run **ffmpeg** download for WebM alpha. ③–④ offline once ffmpeg is present |
 | **Node**     | 18+ if running from source                                       |
-| **Disk**     | ~40 MB+ for the app;                                             |
+| **Disk**     | ~40 MB+ for the app; ~30–80 MB more for managed ffmpeg           |
 
 ---
 
@@ -233,12 +241,13 @@ angelssword-adventurers-creator/
 │   │   ├── features/         # sprite-prep, video-gen, video-prep, exporter, settings
 │   │   └── shared/           # color picker, swatches, upload zone, …
 │   └── README.md
-├── scripts/                  # ensure-ffmpeg, dev-client, build helpers
+├── scripts/                  # ensure-ffmpeg CLI, dev-client, build helpers
+├── lib/                      # Shared server helpers (export temp, ensure-ffmpeg)
 ├── flatpak/                  # Flatpak packaging
 ├── legacy/                   # Vanilla UI snapshots (reference only; see legacy/README.md)
 │   ├── public/               # Complete former root public/ tree
 │   └── vanilla/              # Alternate script snapshot (ex-legacy-vanilla)
-├── bin/                      # Bundled ffmpeg (after ensure-ffmpeg / package)
+├── bin/                      # Managed ffmpeg after ensure (not shipped in releases)
 └── dist/                     # Release outputs
 ```
 
