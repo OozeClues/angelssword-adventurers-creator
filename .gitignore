@@ -6,18 +6,34 @@ backup/
 *.lnk
 tmp-export/
 
-# Managed ffmpeg (downloaded by ensure-ffmpeg / server startup — never commit)
-bin/ffmpeg
-bin/ffmpeg.exe
-bin/ffmpeg.version
-bin/ffmpeg.exe.version
-bin/ffmpeg.LICENSE
-bin/ffmpeg*.old
-bin/ffmpeg*.new
-bin/ffmpeg*.download
+# ---------------------------------------------------------------------------
+# ffmpeg binaries & install artifacts — never commit (auto-downloaded at runtime)
+# Source scripts (scripts/*ffmpeg*, lib/ensure-ffmpeg.cjs) stay tracked.
+# ---------------------------------------------------------------------------
 
-# Accidental CWD stubs (relative path "ffmpeg" written from tests / PATH probes)
+# Entire managed install dir (binaries, license, version sidecars, swap leftovers)
+/bin/
+
+# Root-level accident stubs (relative path "ffmpeg" from PATH/CWD probes)
 /ffmpeg
 /ffmpeg.exe
+/ffprobe
+/ffprobe.exe
 /ffmpeg.version
 /ffmpeg.exe.version
+/ffmpeg.LICENSE
+/ffmpeg.README
+
+# Anywhere outside source: binary names and sidecar/swap files
+ffmpeg.version
+ffmpeg.exe.version
+**/ffmpeg.old
+**/ffmpeg.exe.old
+**/ffmpeg.new
+**/ffmpeg.exe.new
+**/ffmpeg.download
+**/ffmpeg.exe.download
+
+# node_modules already ignored; belt-and-suspenders for extracted static binaries
+node_modules/ffmpeg-static/ffmpeg
+node_modules/ffmpeg-static/ffmpeg.exe
